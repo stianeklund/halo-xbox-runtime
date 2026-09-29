@@ -3,6 +3,7 @@
 
   python3 tools/symbolize.py build/halo.map 0x6aa0ad 0x7f0656
   python3 tools/symbolize.py MAP --host 10.0.0.21 --thread 48   # EBP walk
+  python3 tools/symbolize.py MAP --log debug.txt   # name "XXXXXXXX ?????" frames
 
 Addresses below the legacy end (0x642000) are original cachebeta.xbe VAs and
 are named from kb.json.
@@ -48,6 +49,9 @@ class Symbolizer:
         return '%s+0x%x (%s)' % (n, va - a, o)
 
 
+LOG_FRAME_RE = re.compile(r'\b([0-9A-Fa-f]{8}) (\?{5})\s*$')
+
+
 CODE_LO, CODE_HI = 0x11000, 0x900000
 
 
@@ -88,8 +92,18 @@ def main():
     ap.add_argument('--scan', type=int, default=0,
                     help='also list code pointers among this many stack words from Esp '
                          '(original code omits frame pointers, so the EBP walk stops early)')
+    ap.add_argument('--log', help="annotate a stack_walk log ('-' for stdin): "
+                    'each "<8 hex digits> ?????" frame gets its symbol')
     args = ap.parse_args()
     s = Symbolizer(args.map, args.kb)
+    if args.log:
+        f = sys.stdin if args.log == '-' else open(args.log, errors='replace')
+        for line in f:
+            line = line.rstrip('\r\n')
+            m = LOG_FRAME_RE.search(line)
+            if m:
+                line = line[:m.start(2)] + s.name(int(m.group(1), 16))
+            print(line)
     for a in args.addrs:
         va = int(a, 16)
         print('0x%08x  %s' % (va, s.name(va)))

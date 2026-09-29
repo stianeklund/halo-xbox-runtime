@@ -199,7 +199,20 @@ add_custom_command(
 	VERBATIM
 )
 
-add_custom_target(standalone_xbe ALL DEPENDS "${PROJECT_BINARY_DIR}/default.xbe")
+# The map Halo's stack walker loads from d:\cachebeta.map (D: is the XBE's
+# directory); without it every stack frame prints as "?????".
+add_custom_command(
+	OUTPUT "${PROJECT_BINARY_DIR}/cachebeta.map"
+	COMMAND "${Python3_EXECUTABLE}" "${STANDALONE_TOOLS}/gen_stack_walk_map.py"
+		"${PROJECT_BINARY_DIR}/halo.map" "${PROJECT_BINARY_DIR}/cachebeta.map"
+		--kb "${HALO_ROOT}/kb.json"
+	DEPENDS "${PROJECT_BINARY_DIR}/halo.exe" "${STANDALONE_TOOLS}/gen_stack_walk_map.py"
+		"${HALO_ROOT}/kb.json"
+	VERBATIM
+)
+
+add_custom_target(standalone_xbe ALL DEPENDS "${PROJECT_BINARY_DIR}/default.xbe"
+	"${PROJECT_BINARY_DIR}/cachebeta.map")
 # Target-level ordering: with the Makefile generator a DEPENDS on another
 # target's object files is not rebuilt first, so a changed standalone_crt
 # source compiled after the link was already judged up to date.

@@ -117,6 +117,14 @@ if ! rdcp --timeout 60 --sendfile "$xbe" "$xbox_title"; then
   exit 1
 fi
 
+# The stack walker reads d:\cachebeta.map, i.e. next to the XBE.
+map="$(dirname "$xbe")/cachebeta.map"
+map_title="${xbox_title%\\*}\\cachebeta.map"
+if [[ -f "$map" ]]; then
+  log "uploading ${map} -> ${map_title}"
+  rdcp --timeout 60 --sendfile "$map" "$map_title" || log "map upload failed (stack traces stay unsymbolized)"
+fi
+
 if ((!launch)); then
   log "done (not launched)"
   exit 0
