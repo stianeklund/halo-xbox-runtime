@@ -1643,14 +1643,41 @@ void __stdcall D3DDevice_Clear(uint32_t count, void *rects, uint32_t flags,
   }
   rect = (const d3d_rect *)rects;
   if (d3d_pbkit_ready && d3d_render_target) {
+    unsigned long swizzled_format;
+    uint32_t *p;
+
     if (d3d_targets_dirty) {
       gpu_bind_targets();
+    }
+    /* 0x1ea669..0x1ea6ad: the NV2A only clears pitch surfaces. For a
+     * swizzled target the XDK reprograms SET_SURFACE_FORMAT with the type
+     * switched from SWIZZLE to PITCH (and ~0x200, or 0x100) for the clear,
+     * and 0x1ea9a8..0x1ea9c2 restores the swizzled format afterwards. */
+    swizzled_format = surface_format(d3d_render_target, d3d_depth_stencil);
+    if (((swizzled_format >> SURFACE_FORMAT_TYPE_SHIFT) & 0xf) !=
+        NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE) {
+      swizzled_format = 0;
+    }
+    if (swizzled_format) {
+      p = pb_begin();
+      p = pb_push1(p, NV097_SET_SURFACE_FORMAT,
+                   (swizzled_format &
+                    ~(NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE
+                      << SURFACE_FORMAT_TYPE_SHIFT)) |
+                     (NV097_SET_SURFACE_FORMAT_TYPE_PITCH
+                      << SURFACE_FORMAT_TYPE_SHIFT));
+      pb_end(p);
     }
     if (!d3d_depth_stencil) {
       flags &= ~(uint32_t)(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL);
     }
     for (i = 0; i == 0 || i < count; i++) {
       gpu_clear(count ? &rect[i] : 0, flags, color, depth);
+    }
+    if (swizzled_format) {
+      p = pb_begin();
+      p = pb_push1(p, NV097_SET_SURFACE_FORMAT, swizzled_format);
+      pb_end(p);
     }
     return;
   }
