@@ -16,5 +16,8 @@ cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=$PWD/toolchains/llvm.cmake
 cmake --build build -j             # -> build/default.xbe
 ```
 
+Or use `./build.sh [seed|standalone|nogpu] [--fresh] [--inventory] [--deploy]`,
+which sets the variables above to local defaults (see `./build.sh --help`).
+
 See [docs/standalone-build.md](docs/standalone-build.md) for the design, the
 seeded bring-up variant, the boot-test loop and the status.
