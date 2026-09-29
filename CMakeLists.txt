@@ -14,9 +14,10 @@ cmake_minimum_required(VERSION 3.16)
 project(halo_standalone C)
 set(CMAKE_C_STANDARD 90)
 
+# Any halo checkout or worktree works; the default is the sibling ../halo.
 set(HALO_ROOT "$ENV{HALO_ROOT}" CACHE PATH "halo checkout providing src/, kb.json and tools/")
-if(NOT HALO_ROOT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../halo-clean-main/kb.json")
-	get_filename_component(HALO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../halo-clean-main" ABSOLUTE)
+if(NOT HALO_ROOT AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../halo/kb.json")
+	get_filename_component(HALO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../halo" ABSOLUTE)
 	set(HALO_ROOT "${HALO_ROOT}" CACHE PATH "halo checkout providing src/, kb.json and tools/" FORCE)
 endif()
 if(NOT HALO_ROOT OR NOT EXISTS "${HALO_ROOT}/kb.json" OR NOT EXISTS "${HALO_ROOT}/src/CMakeLists.txt")
@@ -46,6 +47,9 @@ set(HALO_STANDALONE_LAYOUT_XBE "${HALO_ROOT}/halo-patched/cachebeta.xbe" CACHE F
 	"cachebeta.xbe used to classify dependencies in the reports")
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+# The tools/ scripts import halo's own tools (patch.py, knowledge.py) from
+# $HALO_ROOT; pass it explicitly so they never fall back to another checkout.
+set(STANDALONE_PYTHON "${CMAKE_COMMAND}" -E env "HALO_ROOT=${HALO_ROOT}" "${Python3_EXECUTABLE}")
 
 if(NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
 	message(FATAL_ERROR "Use the LLVM toolchain: -DCMAKE_TOOLCHAIN_FILE=toolchains/llvm.cmake")
@@ -142,7 +146,7 @@ endif()
 
 add_custom_command(
 	OUTPUT "${gen_dir}/legacy.s" "${gen_dir}/stubs.s" "${gen_dir}/link_report.json"
-	COMMAND "${Python3_EXECUTABLE}" "${STANDALONE_TOOLS}/gen_legacy_image.py"
+	COMMAND ${STANDALONE_PYTHON} "${STANDALONE_TOOLS}/gen_legacy_image.py"
 		--kb "${HALO_ROOT}/kb.json"
 		--objects "${gen_dir}/objects.txt"
 		--libs "${_nxdk_libs_arg}"
@@ -203,7 +207,7 @@ add_custom_command(
 # directory); without it every stack frame prints as "?????".
 add_custom_command(
 	OUTPUT "${PROJECT_BINARY_DIR}/cachebeta.map"
-	COMMAND "${Python3_EXECUTABLE}" "${STANDALONE_TOOLS}/gen_stack_walk_map.py"
+	COMMAND ${STANDALONE_PYTHON} "${STANDALONE_TOOLS}/gen_stack_walk_map.py"
 		"${PROJECT_BINARY_DIR}/halo.map" "${PROJECT_BINARY_DIR}/cachebeta.map"
 		--kb "${HALO_ROOT}/kb.json"
 	DEPENDS "${PROJECT_BINARY_DIR}/halo.exe" "${STANDALONE_TOOLS}/gen_stack_walk_map.py"
@@ -220,7 +224,7 @@ add_dependencies(standalone_xbe halo standalone_crt)
 
 # Full three-layer dependency inventory over this build's objects.
 add_custom_target(standalone_inventory
-	COMMAND "${Python3_EXECUTABLE}" "${STANDALONE_TOOLS}/deps_inventory.py"
+	COMMAND ${STANDALONE_PYTHON} "${STANDALONE_TOOLS}/deps_inventory.py"
 		--build-dir "${PROJECT_BINARY_DIR}" --object-dir "CMakeFiles/halo.dir"
 		--xbe "${HALO_STANDALONE_LAYOUT_XBE}"
 		--json-out "${PROJECT_BINARY_DIR}/deps_inventory.json"

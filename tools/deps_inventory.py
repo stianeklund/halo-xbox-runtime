@@ -45,10 +45,10 @@ import subprocess
 import sys
 
 # This repository, and the halo checkout it builds from ($HALO_ROOT, default
-# the sibling ../halo-clean-main).
+# the sibling ../halo).
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 ROOT = os.path.abspath(os.environ.get('HALO_ROOT')
-                       or os.path.join(REPO, '..', 'halo-clean-main'))
+                       or os.path.join(REPO, '..', 'halo'))
 
 # Objects that exist only to bind the reconstructed code to the original XBE.
 # The standalone target replaces them (standalone_entry.c).
@@ -416,7 +416,15 @@ def build_closure(kb, image, clf, roots):
 # ---------------------------------------------------------------- main
 
 def collect_objects(build_dir, object_dir):
-    objs = sorted(glob.glob(os.path.join(build_dir, object_dir, '**', '*.obj'), recursive=True))
+    # The link list, when CMake has written it: a build directory that was
+    # switched to another HALO_ROOT still holds the old tree's objects.
+    listing = os.path.join(build_dir, 'generated', 'objects.txt')
+    if os.path.exists(listing):
+        with open(listing) as f:
+            objs = sorted(line.strip() for line in f if line.strip())
+    else:
+        objs = sorted(glob.glob(os.path.join(build_dir, object_dir, '**', '*.obj'),
+                                recursive=True))
     return [o for o in objs if os.path.basename(o) not in XBE_GLUE_OBJECTS]
 
 

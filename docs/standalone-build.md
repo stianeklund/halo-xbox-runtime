@@ -23,7 +23,7 @@ default) uses the XDK. The seeded image boots into `game_initialize` (see
 
 ```bash
 export NXDK_DIR=/path/to/nxdk          # built checkout (make -C $NXDK_DIR/samples/hello once)
-export HALO_ROOT=/path/to/halo         # halo checkout; default ../halo-clean-main
+export HALO_ROOT=/path/to/halo         # halo checkout or worktree; default ../halo
 cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=$PWD/toolchains/llvm.cmake
 cmake --build build -j
 # -> build/default.xbe, halo.map, generated/link_report.json
@@ -106,43 +106,49 @@ Source adaptations (all under `HALO_STANDALONE`, none in reference codegen):
 - `main`'s `__except` filter first calls `standalone_report_exception`
   (`standalone_runtime.c`), which copies the first EXCEPTION_RECORD, CONTEXT and
   256 stack words into globals before the unwind reuses the stack.
-- `physical_memory_map.c` and `xbox_texture_cache.c` use the retail cache
-  sizes (the existing `HALO_RETAIL64` profile). A cxbe-built XBE is limited to
-  64MB, and the debug build's 22MB texture cache plus 4MB sound cache
-  do not fit next to the larger image.
+- `physical_memory_map.c` keeps the build-2276 cache sizes (tag and texture
+  0x1600000, sound 0x400000), and `xbox_texture_cache.c` no longer takes the
+  retail 8MB texture cache for `HALO_STANDALONE`. `bink_playback_start` steals
+  a 16MB pool from the texture cache for hi-res movies (intro.bik); with 8MB
+  it trips `xbox_texture_cache.c:319` (`remaining_page_count>0`).
 
-## Dependency inventory (2026-09-26, 200 objects)
+## Dependency inventory (2026-09-29, halo main 551a28c23, 217 objects)
 
-`tools/deps_inventory.py` measures three layers.
+`tools/deps_inventory.py` measures three layers
+(`cmake --build build-seed --target standalone_inventory`). It reads the
+link's own object list (`generated/objects.txt`), so objects left behind by an
+earlier `HALO_ROOT` in the same build directory are not counted.
 
 **Layer 1: link-level symbols** that the objects leave undefined once
-`halo.xbe.lib` and the generated reg-arg thunks are removed. Provider columns
-come from `generated/link_report.json`.
+`halo.xbe.lib` and the generated reg-arg thunks are removed. The provider
+columns come from `generated/link_report.json`, which classifies a few symbols
+differently from the inventory, so rows do not always add up exactly.
 
 | Category | Undefined | Provided now | Still stubbed | Replacement plan |
 |---|---:|---|---:|---|
-| halo_code | 296 | none | 296 | Lift with `/lift` (the closure below lists 454 in total) |
-| halo_data | 166 | 166 → legacy VAs | 0 | Recover initializers for the initialized range (see layer 2) |
-| kernel | 25 | nxdk libxboxkrnl | 0 | Done |
-| xapi | 57 | 29 stdcall→cdecl winapi bridges, 1 direct, 1 kernel variable, 2 compat (`XPhysicalAlloc`, `physical_memory_protect`) | 24 | Compat layer (`compat/xapi_*.c`): save games, launch info, signatures, XInput, thread/file helpers |
-| crt | 103 | 36 pdclib aliases, 12 direct pdclib/xboxrt | 54 | Mostly unnamed LIBCMT internals (`FUN_001d98xx` = `exit` family, `__open`/`__read`/...). Identify, then alias or compat. |
-| d3d8 | 104 | 1 data symbol | 103 | pbkit-based D3D8 subset (largest single blocker) |
-| dsound | 23 | none | 23 | nxdk has no DirectSound. Needs an AC97/APU mixer compat layer, or silence first. |
-| xnet | 34 | none | 34 | nxdk lwIP sockets, or stub out system link at first |
+| halo_code | 160 | 9 empty bodies (the original is a lone `ret`) | 151 | Lift with `/lift` (the closure below lists 395 in total) |
+| halo_data | 172 | 172 → legacy VAs | 0 | Recover initializers for the initialized range (see layer 2) |
+| kernel | 43 | nxdk libxboxkrnl | 0 | Done |
+| xapi | 40 | 32 stdcall→cdecl winapi bridges, 10 direct nxdk, 1 kernel variable, plus `compat/xapi_*.c` | 6 | Save games (no U: drive yet), remaining launch/signature helpers |
+| crt | 89 | 24 pdclib aliases, 16 direct pdclib/xboxrt | 48 | Mostly unnamed LIBCMT internals (`FUN_001d98xx` = `exit` family, `__open`/`__read`/...). Identify, then alias or compat. |
+| d3d8 | 8 | 1 data symbol, plus `compat/d3d8_*.c` on pbkit | 7 | Push-buffer control (`KickPushBuffer`, `SetPushBufferSize`, `InsertCallback`, `IsBusy`, `BlockOnTime`, `PersistDisplay`). Inside the compat layer, fixed-function combiners, lighting and texture transforms still call `halo_standalone_missing`. |
+| dsound | 30 | `compat/dsound_silent.c` objects | 30 | nxdk has no DirectSound. Needs an AC97/APU mixer compat layer, or silence first. |
+| xnet | 28 | 1 direct nxdk, 1 bridge, plus `compat/xnet.c` | 27 | nxdk lwIP sockets, or stub out system link at first |
 | bink | 63 | 13 data symbols | 50 | Proprietary RAD middleware. Skip intro/attract videos first (stub returns failure), then replace with an open decoder if wanted. |
+| unknown | 37 | nxdk winapi (`CopyFileA`, `Sleep`, ...), `WinMainCRTStartup` | 0 | Done |
 
 **Layer 2: fixed image addresses** compiled into our code (`*(T *)0x2c84c0`,
-`(void *)0x5a90e0`, ...). There are 5,368 distinct addresses at 14,197 sites. The
+`(void *)0x5a90e0`, ...). There are 5,977 distinct addresses at 15,658 sites. The
 legacy layout keeps all of them working, so none blocks linking. They do decide
 what data must be reconstructed:
 
 | Kind | Addresses | Meaning |
 |---|---:|---|
-| halo_data_bss | 2,725 | Zero-initialized. Correct as-is in the legacy layout. |
-| halo_data_init | 1,222 | Needs recovered initial contents (strings, tables, float constants) |
-| maybe_constant | 955 | In-range immediate with no kb symbol. Probably plain integers; review. |
-| halo_code | 363 | Code addresses used as values. Served by the trampolines. |
-| d3d8 / xapi / crt / dsound / bink / unknown | 47 / 37 / 10 / 2 / 1 / 6 | Library internals reached by raw address; handled with each library |
+| halo_data_bss | 2,898 | Zero-initialized. Correct as-is in the legacy layout. |
+| halo_data_init | 1,294 | Needs recovered initial contents (strings, tables, float constants) |
+| maybe_constant | 1,072 | In-range immediate with no kb symbol. Probably plain integers; review. |
+| halo_code | 341 | Code addresses used as values. Served by the trampolines. |
+| d3d8 / xapi / crt / dsound / bink / unknown | 313 / 37 / 10 / 2 / 1 / 9 | Library internals reached by raw address; handled with each library. Most d3d8 sites are in `compat/d3d8_draw.c` (350 sites), which uses XDK const tables and the render-state mirror at their original VAs. |
 
 Initialized data that the unseeded image currently lacks: `.rdata` 0x75430 bytes
 and `.data` 0x69a3c bytes (plus DOLBY 0x6d84 and BINKDATA 0x4250). Seeded runs
@@ -157,9 +163,12 @@ Measured 2026-09-27 against the compiled standalone objects:
 
 **Layer 3: closure.** Walking the original binary's direct calls from the
 layer-1/2 roots, plus unported functions stored in `.data` tables, yields
-**454 of 546 unported Halo functions** (~335 KiB of x86). The same walk reaches
-43 D3D8, 26 XAPI, 24 CRT and 15 DirectSound leaves, and 2,403 `.data`/`.rdata`
-addresses.
+**395 of 595 unported Halo functions** (~216 KiB of x86; 2026-09-26: 454 of
+546, ~335 KiB). They are reached through data tables (149), link symbols (131),
+direct calls (106) and fixed addresses (9). The largest groups are `<common>`
+(67), `ai_debug` (20), `vehicles` (19), `ui_widget` (18) and
+`ui_widget_game_data_input_functions` (15). The same walk reaches 42 D3D8,
+19 CRT, 16 XAPI and 1 DirectSound leaves, and 1,789 `.data`/`.rdata` addresses.
 
 ## Boot results (seeded image, xemu)
 

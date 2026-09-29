@@ -7,11 +7,11 @@ This repository contains only the nxdk-side pieces: XDK compatibility layers
 (`compat/`), CRT fixups (`crt/`), the runtime entry (`standalone_runtime.c`),
 and the build and debug tools (`tools/`). The game code, `kb.json` and the
 reference build tooling come from a halo checkout, which you point at with
-`HALO_ROOT`.
+`HALO_ROOT`. Any halo checkout or worktree works.
 
 ```bash
 export NXDK_DIR=/path/to/nxdk      # built nxdk checkout
-export HALO_ROOT=/path/to/halo     # halo checkout; default ../halo-clean-main
+export HALO_ROOT=/path/to/halo     # halo checkout or worktree; default ../halo
 cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=$PWD/toolchains/llvm.cmake
 cmake --build build -j             # -> build/default.xbe
 ```

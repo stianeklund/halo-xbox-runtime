@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the standalone XBE, upload it over XBDM and launch it — the standalone
-# counterpart of halo-clean-main/tools/xbox/build_deploy_run.sh.
+# counterpart of halo/tools/xbox/build_deploy_run.sh.
 #
 #   tools/build_deploy_run.sh [--xbox HOST] [--native-xbdm] [--watch SECONDS]
 #                             [--no-launch] [-- BUILD_ARGS...]
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export HALO_ROOT="${HALO_ROOT:-$(cd "$here/.." && pwd)/halo-clean-main}"
+export HALO_ROOT="${HALO_ROOT:-$(cd "$here/.." && pwd)/halo}"
 PYTHON="${PYTHON:-/usr/bin/python3}"
 xbox_host="${XBOX_HOST:-127.0.0.1}"
 xbox_title="${XBOX_TITLE:-E:\\GAMES\\halo-patched\\standalone_seed.xbe}"
