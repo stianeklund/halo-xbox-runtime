@@ -81,6 +81,7 @@ int usbh_pooling_hubs(void);
 void usbh_xid_init(void);
 standalone_xid_device *usbh_xid_get_device_list(void);
 int usbh_xid_read(standalone_xid_device *device, uint8_t endpoint, void *callback);
+int usbh_int_xfer(standalone_usb_transfer *transfer);
 int usbh_xid_rumble(standalone_xid_device *device, uint16_t left, uint16_t right);
 
 #define USBH_OK 0
@@ -112,7 +113,6 @@ typedef struct standalone_input_slot {
   uint32_t uid;
   uint32_t packet_number;
   uint8_t connected;
-  uint8_t reading;
   uint8_t report[XID_REPORT_BYTES];
 } standalone_input_slot;
 
@@ -153,7 +153,6 @@ static void input_read_complete(standalone_usb_transfer *transfer)
     return;
   }
   slot = &input_slots[port];
-  slot->reading = 0;
   if (transfer->status < 0 || transfer->transfer_length < sizeof(standalone_xid_gamepad_report)) {
     return;
   }
@@ -163,6 +162,15 @@ static void input_read_complete(standalone_usb_transfer *transfer)
   }
   memcpy(slot->report, transfer->buffer, length);
   slot->packet_number++;
+
+  /* Re-arm from the completion like XAPI's interrupt-in completion (0x24cc10)
+     and nxdk's SDL joystick driver. A failed transfer is not resubmitted;
+     input_refresh_devices queues a fresh read once nxdk marks it done. */
+  transfer->transfer_length = 0;
+  transfer->done = 0;
+  if (usbh_int_xfer(transfer) != USBH_OK) {
+    transfer->done = 1;
+  }
 }
 
 static void input_refresh_devices(void)
@@ -181,10 +189,9 @@ static void input_refresh_devices(void)
       input_slots[port].uid = device->uid;
       input_slots[port].connected = 1;
       connected |= 1u << port;
-      if (!input_slots[port].reading &&
-          usbh_xid_read(device, 0, input_read_complete) == USBH_OK) {
-        input_slots[port].reading = 1;
-      }
+      /* Arms the first read, or a new one after a failed transfer. nxdk
+         refuses while the completion-resubmitted read is still in flight. */
+      usbh_xid_read(device, 0, input_read_complete);
       port++;
     }
     device = device->next;
@@ -192,7 +199,6 @@ static void input_refresh_devices(void)
   while (port < MAXIMUM_GAMEPADS) {
     input_slots[port].device = NULL;
     input_slots[port].connected = 0;
-    input_slots[port].reading = 0;
     port++;
   }
   input_connected_mask = connected;
@@ -290,16 +296,24 @@ void __stdcall standalone_XInputClose(void *handle)
 int __stdcall standalone_XInputGetState(void *handle, standalone_xinput_state *state)
 {
   standalone_input_slot *slot;
+  standalone_xid_gamepad_report copy;
   const standalone_xid_gamepad_report *report;
+  uint32_t packet_number;
+  uint32_t flags;
 
   slot = (standalone_input_slot *)handle;
   if (slot < &input_slots[0] || slot >= &input_slots[MAXIMUM_GAMEPADS] ||
       !slot->connected) {
     return ERROR_DEVICE_NOT_CONNECTED_CODE;
   }
-  input_refresh_devices();
-  report = (const standalone_xid_gamepad_report *)slot->report;
-  state->packet_number = slot->packet_number;
+  /* XAPI only copies the latest report at raised IRQL (0x24c3b6); nxdk
+     completes transfers from the USB ISR, so mask interrupts for the copy. */
+  __asm__ volatile("pushfl\n\tpopl %0\n\tcli" : "=r"(flags) : : "memory");
+  memcpy(&copy, slot->report, sizeof(copy));
+  packet_number = slot->packet_number;
+  __asm__ volatile("pushl %0\n\tpopfl" : : "r"(flags) : "memory", "cc");
+  report = &copy;
+  state->packet_number = packet_number;
   state->gamepad.buttons = report->buttons;
   state->gamepad.analog_buttons[0] = report->a;
   state->gamepad.analog_buttons[1] = report->b;
