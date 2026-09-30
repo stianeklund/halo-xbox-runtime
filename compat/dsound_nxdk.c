@@ -142,7 +142,7 @@ static int __stdcall stream_status(void *stream, unsigned int *status)
   if (!status) return DS_INVALID;
   standalone_audio_lock();
   for (i = 0; i < AUDIO_PACKET_COUNT; i++) if (o->voice.packets[i].state) count++;
-  *status = (count < o->max_packets && audio_voice_ready(&o->voice) ? 1 : 0) |
+  *status = (count < o->max_packets && audio_output_ready(&o->voice) ? 1 : 0) |
             (audio_voice_active(&o->voice) ? 0x10000 : 0) | (o->voice.paused ? 0x20000 : 0);
   standalone_audio_unlock();
   return DS_OK;

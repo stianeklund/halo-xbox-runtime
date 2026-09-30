@@ -225,10 +225,42 @@ def test_stop_timeout_retains_ownership(build):
     assert not image.voices[image.hardware(stream)]["destroyed"]
     assert not image.freed and not image.callbacks
     assert image.words(done)[0] == 0 and image.words(status)[0] == 0x8000000a
+    stream_status = image.alloc(bytes(4))
+    assert image.method(stream, 3, stream_status) == 0
+    assert not image.words(stream_status)[0] & 1, "stopping stream advertised READY"
     assert image.submit(stream, pcm(900))[0] == 0x80070057
     image.stop_timeout = False
     image.release(stream)
     assert image.callbacks == [(42, 99, 0x80004004)]
+
+
+def test_stop_timeout_late_completion(build):
+    image = ApuImage(build)
+    stream = image.stream()
+    packets = [image.submit(stream, pcm(i), i) for i in range(4)]
+    hardware = image.hardware(stream)
+    image.stop_timeout = True
+    assert image.method(stream, 6) == 0x80004005
+    assert not image.voices[hardware]["destroyed"]
+    assert not image.callbacks and not image.freed
+    image.call("_standalone_audio_poll")
+    assert not image.voices[hardware]["destroyed"]
+    # The idle DPC can arrive after Flush timed out, leaving packets which
+    # never reached either hardware slot. Halo waits on the active bit before
+    # retrying Flush, so polling must retire those packets without callbacks.
+    image.write(hardware, 3)
+    image.call("_standalone_audio_poll")
+    assert image.words(stream + 0x30)[0] == 0, "late stop left stream active"
+    assert image.voices[hardware]["destroyed"]
+    assert not image.callbacks
+    image.service()
+    assert image.callbacks == [(42, i, 0x80004004) for i in range(4)]
+    assert all(image.words(status)[0] == 0x80004004 for _, _, status in packets)
+    assert image.submit(stream, pcm(7), 7)[0] == 0
+    image.complete(stream)
+    image.service()
+    image.stop_timeout = False
+    image.release(stream)
 
 
 def test_halo_channel_reuse(build):
@@ -318,6 +350,7 @@ if __name__ == "__main__":
     build = Path(sys.argv[1] if len(sys.argv) > 1 else "build-apu")
     for test in (test_four_packets_and_coalesced_completion, test_completion_before_next_process,
                  test_pause_gain_pitch_and_adpcm, test_stop_timeout_retains_ownership,
+                 test_stop_timeout_late_completion,
                  test_halo_channel_reuse, test_static_buffer, test_driver_descriptor_retirement_and_pinning):
         test(build)
         print(f"PASS {test.__name__}")

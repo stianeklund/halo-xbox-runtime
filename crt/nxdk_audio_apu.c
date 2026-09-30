@@ -138,10 +138,9 @@ static int stop_voice(struct apu_voice *h)
     return 0;
 }
 
-int audio_output_flush(struct audio_voice *v)
+static void finish_flush(struct audio_voice *v)
 {
     struct apu_voice *h = v->backend;
-    if (!stop_voice(h)) return 0;
     if (h->valid) {
         nxAudioVoiceDestroy(&h->hardware);
         halo_audio_apu_stats[2]++;
@@ -152,7 +151,19 @@ int audio_output_flush(struct audio_voice *v)
     audio_voice_flush(v);
     /* Recreate on the next submission/play. A stopped channel need not own
      * an APU slot, and the old driver descriptors no longer pin cache pages. */
+}
+
+int audio_output_flush(struct audio_voice *v)
+{
+    if (!stop_voice(v->backend)) return 0;
+    finish_flush(v);
     return 1;
+}
+
+int audio_output_ready(const struct audio_voice *v)
+{
+    const struct apu_voice *h = v->backend;
+    return audio_voice_ready(v) && (!h->valid || !h->stopping);
 }
 
 void audio_output_destroy(struct audio_voice *v)
@@ -249,6 +260,14 @@ void audio_output_poll(struct audio_voice *v)
 {
     struct apu_voice *h = v->backend;
     if (!h || !h->valid) return;
+    /* Flush can time out before the idle DPC finishes. Halo waits for the
+     * active bit to clear before retrying Flush. Retire every remaining
+     * packet once DMA ownership ends, including packets never queued to
+     * hardware. Game callbacks still run only from DirectSoundDoWork. */
+    if (h->stopping && nxAudioVoiceGetState(&h->hardware) == NX_STOPPED) {
+        finish_flush(v);
+        return;
+    }
     if (!h->stream) {
         if (nxAudioVoiceGetState(&h->hardware) == NX_STOPPED) v->playing = 0;
         return;

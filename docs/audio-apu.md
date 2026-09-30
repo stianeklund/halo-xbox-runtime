@@ -61,6 +61,15 @@ retains the object/data instead of releasing memory the APU might still read.
 An aborted hardware packet currently reports zero completed bytes; partial
 hardware cursor accounting is not implemented.
 
+If the idle DPC finishes after the synchronous stop timeout, the worker
+finishes the flush once the driver reports `NX_STOPPED`. It retires both
+hardware-owned and still-waiting packets, clears the active bit, and leaves
+their abort callbacks for `DirectSoundDoWork`. A stopping stream does not
+advertise readiness for more packets. Without this recovery, campaign revert
+can wait indefinitely in `sound_stop_all` even though its hardware voices
+have stopped. The linked regression reproduces a delayed idle DPC with four
+packets and two hardware slots and checks safe retirement and channel reuse.
+
 Local upstream patches clear completed streaming SSL descriptors before
 unlocking their buffers (otherwise persistent voices can replay stale data),
 keep static buffer pages pinned until replacement or destruction,

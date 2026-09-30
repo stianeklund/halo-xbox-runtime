@@ -8,6 +8,7 @@ int audio_output_create(struct audio_voice *v, int stream);
 void audio_output_destroy(struct audio_voice *v);
 int audio_output_submit(struct audio_voice *v, const struct audio_packet *packet);
 int audio_output_flush(struct audio_voice *v);
+int audio_output_ready(const struct audio_voice *v);
 void audio_output_poll(struct audio_voice *v);
 int audio_output_volume(struct audio_voice *v);
 int audio_output_frequency(struct audio_voice *v, unsigned int frequency);
@@ -20,6 +21,7 @@ static inline int audio_output_create(struct audio_voice *v, int stream) { (void
 static inline void audio_output_destroy(struct audio_voice *v) { (void)v; }
 static inline int audio_output_submit(struct audio_voice *v, const struct audio_packet *p) { return audio_voice_submit(v, p); }
 static inline int audio_output_flush(struct audio_voice *v) { audio_voice_flush(v); return 1; }
+static inline int audio_output_ready(const struct audio_voice *v) { return audio_voice_ready(v); }
 static inline void audio_output_poll(struct audio_voice *v) { (void)v; }
 static inline int audio_output_volume(struct audio_voice *v) { (void)v; return 1; }
 static inline int audio_output_frequency(struct audio_voice *v, unsigned int frequency) { (void)v; (void)frequency; return 1; }
