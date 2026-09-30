@@ -80,6 +80,7 @@ add_custom_command(
 	OUTPUT "${gen_dir}/build_info.c"
 	COMMAND "${Python3_EXECUTABLE}" "${HALO_ROOT}/tools/build/gen-build-info.py" > "${gen_dir}/build_info.c"
 	DEPENDS "${HALO_ROOT}/tools/build/gen-build-info.py"
+	WORKING_DIRECTORY "${HALO_ROOT}"
 	VERBATIM
 )
 

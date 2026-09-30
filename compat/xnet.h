@@ -22,8 +22,15 @@ XNET_DECL(int, xnet_connect, 12, (int s, const void *addr, int len));
 XNET_DECL(int, xnet_listen, 8, (int s, int backlog));
 XNET_DECL(int, xnet_accept, 12, (int s, void *addr, int *len));
 XNET_DECL(int, xnet_closesocket, 4, (int s));
-XNET_DECL(int, xnet_getsockname, 12, (int s, void *addr, int *len));
-XNET_DECL(int, xnet_getpeername, 12, (int s, void *addr, int *len));
+/* The Halo catalog labels these two original entrypoints backwards:
+ * 0x22486b is local (bound port +0x4a, INADDR_ANY); 0x224876 is peer
+ * (connected flag, remote IP +0x44 / port +0x48). Keep adapter C names
+ * semantic, but bind them to the symbols emitted by that catalog. Otherwise
+ * FUN_00083a60 returns the client's TCP port as the server's UDP destination. */
+int XNET_CALL halo_xnet_getsockname(int s, void *addr, int *len)
+    XNET_SYMBOL("xnet_getpeername", 12);
+int XNET_CALL halo_xnet_getpeername(int s, void *addr, int *len)
+    XNET_SYMBOL("xnet_getsockname", 12);
 XNET_DECL(int, xnet_ioctlsocket, 12, (int s, int cmd, uint32_t *arg));
 XNET_DECL(int, xnet_select, 20, (int ignored, uint32_t *read_set, uint32_t *write_set, uint32_t *except_set, const int32_t *timeout));
 XNET_DECL(int, xnet_wsafdisset, 8, (int s, uint32_t *set));
@@ -36,6 +43,7 @@ XNET_DECL(int, xnet_sendto, 24, (int s, const void *buf, int len, int flags, con
 int XNET_CALL halo_XNetStartup(const void *params) XNET_SYMBOL("FUN_002231f8", 4);
 int XNET_CALL halo_WSAStartup(int version, void *data) XNET_SYMBOL("FUN_00223206", 8);
 int XNET_CALL halo_XNetGetTitleXnAddr(void *addr) XNET_SYMBOL("FUN_00222ecf", 4);
+int XNET_CALL halo_XNetGetDebugXnAddr(void *addr) XNET_SYMBOL("FUN_00222ee4", 4);
 int XNET_CALL halo_XNetRandom(void *data, int len) XNET_SYMBOL("FUN_00222e0e", 8);
 int XNET_CALL halo_XNetCreateKey(void *id, void *key) XNET_SYMBOL("FUN_00222da0", 8);
 int XNET_CALL halo_XNetRegisterKey(void *id, void *key) XNET_SYMBOL("FUN_00222de0", 8);
@@ -57,6 +65,7 @@ int halo_net_register(const void *id, const void *key);
 int halo_net_unregister(const void *id);
 int halo_net_map(const struct halo_xnaddr *addr, const void *id, uint32_t *ip);
 int halo_net_address(struct halo_xnaddr *addr);
+int halo_net_debug_address(struct halo_xnaddr *addr);
 uint32_t halo_net_link(void);
 int halo_net_random(void *data, unsigned len);
 #endif

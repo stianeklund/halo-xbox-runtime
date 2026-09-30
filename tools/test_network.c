@@ -19,6 +19,11 @@ int halo_net_address(struct halo_xnaddr *addr)
     memset(addr, 0, sizeof(*addr)); addr->size=12; addr->address = htonl(INADDR_LOOPBACK);
     memset(addr->ethernet, 0x42, 6); return 6;
 }
+int halo_net_debug_address(struct halo_xnaddr *addr)
+{
+    memset(addr, 0, sizeof(*addr)); addr->size = 12;
+    addr->address = htonl(0x0a00020f); return 6;
+}
 int halo_net_random(void *data, unsigned len)
 {
     static unsigned serial;
@@ -115,6 +120,19 @@ static void tcp(void)
     wait_read(peer);
     assert(halo_xnet_recv(peer, buffer, 8, 0) == 3 && !memcmp(buffer, "tcp", 3));
     assert(halo_xnet_getpeername(client, &remote, &len) == 0 && remote.port == addr.port);
+    /* Halo addresses UDP game updates using the TCP connection's peer port.
+     * Its local TCP port must not be mistaken for that destination. */
+    {
+        struct halo_sockaddr local;
+        int udp_server = halo_xnet_socket(2, 2, 17);
+        int udp_client = halo_xnet_socket(2, 2, 17);
+        assert(halo_xnet_getsockname(client, &local, &len) == 0 && local.port != remote.port);
+        assert(halo_xnet_bind(udp_server, &remote, 16) == 0);
+        assert(halo_xnet_sendto(udp_client, "tick", 4, 0, &remote, 16) == 4);
+        wait_read(udp_server);
+        assert(halo_xnet_recv(udp_server, buffer, 8, 0) == 4 && !memcmp(buffer, "tick", 4));
+        assert(halo_xnet_closesocket(udp_client) == 0 && halo_xnet_closesocket(udp_server) == 0);
+    }
     assert(halo_xnet_setsockopt(client, 0xffff, 0x80, linger, 4) == 0);
     assert(halo_xnet_getsockopt(client, 0xffff, 0x80, out, &optlen) == 0 && out[0] == 1 && out[1] == 1);
     assert(halo_xnet_closesocket(peer) == 0 && halo_xnet_closesocket(client) == 0);
@@ -185,6 +203,7 @@ int main(void)
     memset(data, 0x55, sizeof(data));
     assert(halo_WSAStartup(2, data) == 0 && data[0] == 2 && data[0x190] == 0x55);
     assert(halo_XNetGetTitleXnAddr(&addr) == 6 && addr.address == htonl(INADDR_LOOPBACK));
+    assert(halo_XNetGetDebugXnAddr(&addr) == 6 && addr.address == htonl(0x0a00020f));
     assert(halo_XNetCreateKey(id, key) == 0);
     assert(halo_XNetRegisterKey(id, key) == 0);
     assert(halo_XNetRegisterKey(id, key) == 10037);

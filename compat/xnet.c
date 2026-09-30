@@ -158,6 +158,12 @@ int XNET_CALL halo_XNetGetTitleXnAddr(void *addr)
     if (!addr) return fail(10014);
     return halo_net_address(addr);
 }
+
+int XNET_CALL halo_XNetGetDebugXnAddr(void *addr)
+{
+    if (!addr) return fail(10014);
+    return halo_net_debug_address(addr);
+}
 uint32_t halo_XNetGetEthernetLinkStatus(void) { return halo_net_link(); }
 int XNET_CALL halo_XNetRandom(void *data, int len)
 {

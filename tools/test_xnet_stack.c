@@ -16,9 +16,12 @@ void halo_xnet_attach(struct netif *);
 err_t halo_xnet_input(struct pbuf *, struct netif *);
 struct netif *halo_net_secure_route(const ip4_addr_t *);
 unsigned char XboxLANKey[16] = "TESTTESTTESTTEST";
+unsigned char debug_flags;
 static unsigned char frame[1600];
 static unsigned frame_size, frames_sent, plain_sent, received;
 static unsigned random_counter;
+static struct { tcpip_callback_fn fn; void *ctx; } callbacks[64];
+static unsigned callback_head, callback_tail;
 
 u32_t sys_now(void) { return 0; }
 void sys_init(void) {}
@@ -31,7 +34,20 @@ u32_t sys_arch_sem_wait(sys_sem_t *s, u32_t ms) { (void)s; (void)ms; assert(0); 
 err_t tcpip_inpkt(struct pbuf *p, struct netif *n, netif_input_fn input)
 { return input(p, n); }
 err_t tcpip_input(struct pbuf *p, struct netif *n) { return ip4_input(p, n); }
-err_t tcpip_try_callback(tcpip_callback_fn fn, void *ctx) { fn(ctx); return ERR_OK; }
+err_t tcpip_try_callback(tcpip_callback_fn fn, void *ctx)
+{
+  assert(callback_tail - callback_head < 64);
+  callbacks[callback_tail % 64].fn = fn;
+  callbacks[callback_tail++ % 64].ctx = ctx;
+  return ERR_OK;
+}
+static void run_callbacks(void)
+{
+  while (callback_head != callback_tail) {
+    unsigned slot = callback_head++ % 64;
+    callbacks[slot].fn(callbacks[slot].ctx);
+  }
+}
 void XcHMAC(void *key, uint32_t kn, void *a, uint32_t an, void *b, uint32_t bn, void *out)
 {
   unsigned char buf[2048];
@@ -112,6 +128,60 @@ static void inject(struct netif *n, const unsigned char *data, unsigned size)
   assert(p && pbuf_take(p, data, size) == ERR_OK);
   assert(halo_xnet_input(p, n) == ERR_OK);
 }
+static struct tcp_pcb *local_accepted;
+static unsigned local_connected, local_received;
+static err_t recv_local(void *user, struct tcp_pcb *pcb, struct pbuf *p, err_t error)
+{
+  char data[4];
+  (void)user;
+  assert(error == ERR_OK && p && p->tot_len == sizeof(data));
+  assert(pbuf_copy_partial(p, data, sizeof(data), 0) == sizeof(data));
+  assert(!memcmp(data, "halo", sizeof(data)));
+  tcp_recved(pcb, p->tot_len);
+  pbuf_free(p);
+  local_received++;
+  return ERR_OK;
+}
+static err_t accept_local(void *user, struct tcp_pcb *pcb, err_t error)
+{
+  (void)user;
+  assert(error == ERR_OK && !local_accepted);
+  local_accepted = pcb;
+  tcp_recv(pcb, recv_local);
+  return ERR_OK;
+}
+static err_t connect_local(void *user, struct tcp_pcb *pcb, err_t error)
+{
+  (void)user;
+  assert(error == ERR_OK && ip4_addr_isloopback(ip_2_ip4(&pcb->local_ip)));
+  local_connected++;
+  return ERR_OK;
+}
+static void test_local_server(void)
+{
+  struct tcp_pcb *listener = tcp_new(), *client = tcp_new();
+  ip_addr_t dest;
+  unsigned wire_before = frames_sent, plain_before = plain_sent;
+  assert(listener && client);
+  assert(tcp_bind(listener, IP_ADDR_ANY, 5150) == ERR_OK);
+  listener = tcp_listen(listener);
+  assert(listener);
+  tcp_accept(listener, accept_local);
+  IP_ADDR4(&dest, 127,0,0,1);
+  assert(tcp_connect(client, &dest, 5150, connect_local) == ERR_OK);
+  run_callbacks();
+  assert(local_connected == 1 && local_accepted);
+  assert(tcp_write(client, "halo", 4, TCP_WRITE_FLAG_COPY) == ERR_OK);
+  assert(tcp_output(client) == ERR_OK);
+  run_callbacks();
+  assert(local_received == 1);
+  assert(frames_sent == wire_before && plain_sent == plain_before);
+  tcp_abort(client);
+  tcp_abort(local_accepted);
+  local_accepted = NULL;
+  assert(tcp_close(listener) == ERR_OK);
+  run_callbacks();
+}
 int main(void)
 {
   struct netif physical;
@@ -156,7 +226,9 @@ int main(void)
   assert(pbuf_take(p, "halo", 4) == ERR_OK);
   IP_ADDR4(&dest, 127,0,0,1);
   assert(udp_sendto(udp, p, &dest, 1000) == ERR_OK);
+  run_callbacks();
   assert(received == 2 && frames_sent == 1);
+  test_local_server();
   assert(halo_net_register(id, key) == 0 && halo_net_map(&peer, id, &mapped) == 0);
   ip_addr_set_ip4_u32(&dest, mapped);
   tcp = tcp_new(); assert(tcp);
@@ -173,7 +245,9 @@ int main(void)
   assert(udp_sendto(udp, p, &dest, 1000) == ERR_OK);
   assert(plain_sent == 0 && !memcmp(frame + 42, "\xff\xff\xff\xff", 4));
   pbuf_free(p); udp_remove(udp); halo_net_security_clear();
+  extern void test_debug_netif(void);
+  test_debug_netif();
   OSSL_PROVIDER_unload(legacy); OSSL_PROVIDER_unload(normal);
-  puts("PASS: real lwIP discovery without DHCP, packet checksums, tamper rejection, loopback, TCP secure routing and bypass broadcast");
+  puts("PASS: real lwIP discovery without DHCP, packet checksums, tamper rejection, UDP loopback, local TCP server on 5150, TCP secure routing, bypass broadcast and shared XBDM NIC ownership/address separation");
   return 0;
 }

@@ -17,26 +17,31 @@ with tempfile.TemporaryDirectory(prefix="halo-xnet-stack-") as directory:
     temp = Path(directory)
     (temp / "arch").mkdir()
     (temp / "xboxkrnl").mkdir()
-    (temp / "lwipopts.h").write_text("""
-#define NO_SYS 0
+    # Use the Xbox configuration, overriding only host platform/shim choices.
+    # Previously independent defaults hid the production single-netif defect.
+    (temp / "lwipopts.h").write_text(f'#include "{root / "crt/net/lwipopts.h"}"\n' + """
+#undef SYS_LIGHTWEIGHT_PROT
 #define SYS_LIGHTWEIGHT_PROT 0
+#undef LWIP_TCPIP_CORE_LOCKING
 #define LWIP_TCPIP_CORE_LOCKING 0
+#undef LWIP_NETCONN
 #define LWIP_NETCONN 0
+#undef LWIP_SOCKET
 #define LWIP_SOCKET 0
+#undef LWIP_IPV6
 #define LWIP_IPV6 0
-#define LWIP_NETIF_LOOPBACK 1
-#define LWIP_NETIF_LOOPBACK_MULTITHREADING 1
-#define IP_SOF_BROADCAST 1
-#define IP_SOF_BROADCAST_RECV 1
-#define MEM_SIZE (256*1024)
+#undef MEM_CUSTOM_ALLOCATOR
+#define MEM_CUSTOM_ALLOCATOR 0
+#undef MEM_ALIGNMENT
 #define MEM_ALIGNMENT 8
-#define MEMP_NUM_SYS_TIMEOUT (LWIP_NUM_SYS_TIMEOUT_INTERNAL + 4)
-#define LWIP_HOOK_FILENAME "halo_net_route.h"
-#define LWIP_HOOK_IP4_ROUTE(dest) halo_net_secure_route(dest)
+#undef LWIP_HOOK_DHCP_APPEND_OPTIONS
 """)
     (temp / "arch/cc.h").write_text("""
 #include <assert.h>
-#define LWIP_PLATFORM_DIAG(x) ((void)0)
+#include <stdlib.h>
+#include <stdio.h>
+#define LWIP_RAND() ((unsigned)rand())
+#define LWIP_PLATFORM_DIAG(x) do { if (0) printf x; } while (0)
 #define LWIP_PLATFORM_ASSERT(x) assert(!(x))
 """)
     (temp / "arch/sys_arch.h").write_text("""
@@ -49,7 +54,15 @@ typedef void *sys_thread_t;
     (temp / "xboxkrnl/xboxkrnl.h").write_text("""
 #include <stdint.h>
 typedef uint32_t ULONG;
+typedef unsigned char KIRQL;
 extern unsigned char XboxLANKey[16];
+KIRQL KeRaiseIrqlToDpcLevel(void);
+void KfLowerIrql(KIRQL);
+void *ExAllocatePoolWithTag(unsigned long, ULONG);
+void ExFreePool(void *);
+unsigned long PhyGetLinkState(unsigned long);
+void DbgPrint(const char *, ...);
+#define XNET_ETHERNET_LINK_ACTIVE 1
 void XcHMAC(void *, ULONG, void *, ULONG, void *, ULONG, void *);
 void XcKeyTable(ULONG, void *, void *);
 void XcBlockCryptCBC(ULONG, ULONG, void *, void *, void *, ULONG, void *);
@@ -60,12 +73,14 @@ ULONG XcModExp(ULONG *, ULONG *, ULONG *, ULONG *, ULONG);
     sources = sorted((lwip / "core").glob("*.c"))
     sources += sorted((lwip / "core/ipv4").glob("*.c"))
     sources += [lwip / "netif/ethernet.c", root / "compat/xnet_security.c",
-                root / "crt/nxdk_xnet.c", root / "tools/test_xnet_stack.c"]
+                root / "crt/nxdk_xnet.c", root / "tools/test_xnet_stack.c",
+                root / "tools/test_debug_net.c"]
     binary = temp / "test-stack"
     subprocess.run([
         *shlex.split(os.environ.get("CC", "cc")), "-std=c11", "-Wall", "-Wextra",
         "-Werror", "-DHALO_NETWORK_HOST_TEST", "-fsanitize=address,undefined", "-g",
         "-I" + str(temp), "-I" + str(root / "crt/net"),
+        "-I" + str(sdk / "lib"),
         "-I" + str(lwip / "include"), *map(str, sources), "-lcrypto", "-o", str(binary),
     ], check=True)
     subprocess.run([str(binary)], check=True, timeout=15,

@@ -35,6 +35,9 @@ packet framing, replay checks and reconnect state. `crt/nxdk_xnet.c` wraps inner
 TCP/UDP segments in Ethernet-addressed UDP 3074 packets and delivers verified
 segments through a separate lwIP interface for virtual 0/8 addresses. Discovery
 also uses this interface before DHCP completes. Loopback uses lwIP's local path.
+The build explicitly enables multiple netifs and lwIP's loopback interface;
+nxdk's default single-netif route rejects 127/8. The local split-screen client
+must connect to its server at 127.0.0.1:5150 without using the physical NIC.
 The TCP/IP worker has a 32 KiB stack for the codec and kernel crypto calls;
 packet processing is queued out of the NIC interrupt.
 
@@ -44,6 +47,43 @@ LAN key into the build; runtime kernel keys are not copied into the image.
 Random generation persists a rekeyed device-keyed seed on T: before returning
 bytes and fails on missing device-key or storage errors. Startup flag 1 allows
 plain LAN IPv4 traffic; secure mappings and discovery remain encrypted.
+
+The recovered catalog reverses the names of the original socket-address
+queries: 0x22486b returns the local bound address, while 0x224876 returns the
+connected peer. The adapter binds its semantic C functions to those existing
+catalog symbols accordingly. This matters after a split-screen map loads:
+Halo queries the TCP peer to address its UDP client updates to the server.
+Returning the local TCP port instead leaves those updates undelivered.
+
+## Debugger coexistence
+
+`crt/nxdk_debug_net.c` detects the resident XBDM `XBD6` shared-NIC interface
+through the same processor-local pointer as cachebeta XNet. With that interface
+present, nxdk registers title callbacks and submits Ethernet packets through
+XBDM, instead of resetting the NIC with NVNET. XBDM keeps its own debug IP and
+TCP/IP stack; lwIP obtains the title IP with the title MAC and network settings.
+Without XBDM, the normal NVNET driver is used. An unknown sharing ABI fails
+title network startup while preserving the debugger's adapter.
+
+Receive callbacks copy XBDM's loaned frames before returning. Transmit copies
+remain in kernel pool memory until XBDM reports completion. Driver calls run at
+DPC level; title-address callbacks use a published snapshot rather than taking
+lwIP's core mutex from a DPC. Title link status is polled on the TCP/IP worker.
+`XNetGetDebugXnAddr` obtains the separate debug address in the target's 12-byte
+layout. Halo's telnet listener remains a title-side TCP service on port 23;
+XBDM is the debugger-side service on port 731. NAT forwards must select the
+appropriate guest IP and port; host 127.0.0.1 is separate from title loopback.
+
+The sharing ABI was checked against cachebeta 2276 and resident XBDM
+1.00.5849.4. A seeded title obtained 10.0.2.16 through DHCP while XBDM at
+10.0.2.15 remained accessible through the existing host port forward. Other
+XBDM versions and physical devkits still need runtime validation.
+
+The combined networking/APU build was launched with `magicboot` in xemu.
+XBDM remained accessible while the game ran, confirmed by the user. APU
+telemetry showed buffers completing with no driver errors or stop timeouts.
+Remaining game stubs still limit gameplay testing; this does not establish
+stock-peer interoperability or complete gameplay/audio behavior.
 
 Stock-peer interoperability still needs a live test. See
 [xnet-security-brief.md](xnet-security-brief.md) for target evidence and outstanding
@@ -64,10 +104,20 @@ pyxbe, Unicorn and cryptography in addition to OpenSSL development headers.
 `python3 tools/test_xnet_stack.py` builds nxdk's real lwIP sources with host
 kernel/NIC/scheduling shims and tests the production packet adapter: encrypted
 discovery without DHCP, inbound checksum/integrity checks, loopback delivery,
-TCP SYN routing to secure peers, and encrypted discovery under startup flag 1.
+TCP SYN routing to secure peers, encrypted discovery under startup flag 1,
+a local TCP server on port 5150, and shared-NIC buffer ownership, title/debug
+address separation, driver selection, and link updates. It uses the production
+lwIP options rather than independently chosen routing defaults.
 Its host allocator alignment differs from Xbox's to accommodate 64-bit pointers;
 it does not emulate the NVNET driver or TCP/IP worker concurrency.
 A seeded Xbox build verifies the nxdk headers, object ABI and linkage;
 multiplayer hosting/joining still requires an emulator/device runtime test.
+
+After building, run `python3 tools/check_socket_name_abi.py --build BUILD_DIR
+--reference-xbe /path/to/cachebeta.xbe` to execute the original local/peer
+queries and the built legacy dispatch in Unicorn. It also executes Halo's
+endpoint-address lookup and checks that its UDP destination is the remote
+server port, rather than the client's local TCP port. This needs pyxbe,
+pefile and Unicorn; the lwIP address queries use controlled socket fixtures.
 
 Build with `NXDK_DIR=/mnt/g/dev/nxdk HALO_ROOT=/mnt/g/dev/halo ./build.sh seed --inventory`.

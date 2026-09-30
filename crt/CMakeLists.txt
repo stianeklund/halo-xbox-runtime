@@ -4,7 +4,7 @@
 set(CMAKE_C_FLAGS "-target i386-pc-win32 -march=pentium3 -ffreestanding -nostdlib -fno-builtin -Wno-builtin-macro-redefined -DNXDK -D__STDC__=1 -U__STDC_NO_THREADS__")
 set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG")
 
-add_library(standalone_crt OBJECT msvc_print.c pdclib_open.c nxdk_net.c nxdk_xnet.c ../compat/xnet.c ../compat/xnet_security.c)
+add_library(standalone_crt OBJECT msvc_print.c pdclib_open.c nxdk_net.c nxdk_debug_net.c nxdk_xnet.c ../compat/xnet.c ../compat/xnet_security.c)
 add_custom_command(
     OUTPUT "${gen_dir}/xnet_profile.h"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/gen_xnet_profile.py"

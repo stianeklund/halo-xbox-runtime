@@ -1,5 +1,6 @@
 /* Initialise NIC/lwIP once: nxdk has no TCP/IP-worker teardown support. */
 #include "../compat/xnet.h"
+#include "nxdk_debug_net.h"
 #include <lwip/dhcp.h>
 #include <lwip/netifapi.h>
 #include <lwip/tcpip.h>
@@ -16,7 +17,6 @@ _Static_assert(MEMP_NUM_UDP_PCB > MEMP_NUM_NETCONN,
 static struct netif halo_netif;
 static volatile LONG init_state;
 static int init_result, use_dhcp;
-err_t nvnetif_init(struct netif *netif);
 err_t halo_xnet_input(struct pbuf *p, struct netif *netif);
 void halo_xnet_attach(struct netif *netif);
 static void tcpip_ready(void *event) {
@@ -43,7 +43,7 @@ int halo_net_init(void) {
   tcpip_init(tcpip_ready, &ready);
   KeWaitForSingleObject(&ready, Executive, KernelMode, FALSE, NULL);
   result = netifapi_netif_add(&halo_netif, &ip, &mask, &gateway, NULL,
-                              nvnetif_init, halo_xnet_input);
+                              halo_debug_netif_init, halo_xnet_input);
   if (result == ERR_OK) {
     LOCK_TCPIP_CORE();
     halo_xnet_attach(&halo_netif);

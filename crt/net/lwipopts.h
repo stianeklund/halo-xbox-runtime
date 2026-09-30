@@ -31,7 +31,14 @@
 #define SO_REUSE 1
 #define IP_SOF_BROADCAST 1
 #define IP_SOF_BROADCAST_RECV 1
+/* The physical title interface, secure 0/8 interface, and local server need
+ * distinct routes. nxdk defaults to one interface and no loopback interface. */
+#undef LWIP_SINGLE_NETIF
+#define LWIP_SINGLE_NETIF 0
+#undef LWIP_HAVE_LOOPIF
+#define LWIP_HAVE_LOOPIF 1
 #define LWIP_NETIF_LOOPBACK 1
+#define LWIP_NETIF_STATUS_CALLBACK 1
 #define LWIP_HOOK_FILENAME "halo_net_route.h"
 #define LWIP_HOOK_IP4_ROUTE(dest) halo_net_secure_route(dest)
 #endif
