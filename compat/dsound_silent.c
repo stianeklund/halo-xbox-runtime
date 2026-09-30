@@ -103,28 +103,6 @@ static long new_stream(void **out)
   return result;
 }
 
-/* 0x1cb210: the real backend fills the channel and creates its stream. The
- * silent backend preserves the fields consumed by the game-side channel code
- * and supplies an inert stream with the same pointer location. */
-boolean dsound_initialize_channel(short type_flags, short channel_index)
-{
-  unsigned char *channel;
-  void *stream;
-
-  channel = (unsigned char *)sound_dsound_channel_get(channel_index);
-  *(short *)(channel + 0x02) = -1;
-  *(uint8_t *)(channel + 0x06) = 0;
-  *(short *)(channel + 0x38) = type_flags;
-  *(uint32_t *)(channel + 0x68) = 0;
-  *(uint32_t *)(channel + 0x6c) = 0;
-  stream = NULL;
-  if (new_stream(&stream) != DS_OK) {
-    return false;
-  }
-  *(void **)(channel + 0x70) = stream;
-  return true;
-}
-
 long __stdcall standalone_DirectSoundCreate(void *device_id, void **out_dsound, void *outer)
 {
   (void)device_id;

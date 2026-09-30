@@ -252,5 +252,7 @@ void audio_voice_mix(struct audio_voice *v, int *stereo, unsigned int frames)
 void audio_mix_clip(const int *mixed, short *output, unsigned int frames)
 {
   unsigned int i;
-  for (i = 0; i < frames * 2; i++) output[i] = (short)clamp_sample(mixed[i]);
+  /* DirectSound voice headroom is already included in each voice gain. */
+  for (i = 0; i < frames * 2; i++)
+    output[i] = (short)clamp_sample(mixed[i]);
 }

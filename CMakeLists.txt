@@ -41,8 +41,8 @@ endif()
 # (but not yet runnable) image.
 set(HALO_STANDALONE_SEED_XBE "" CACHE FILEPATH "DEV ONLY: seed legacy data from this cachebeta.xbe")
 option(HALO_STANDALONE_GPU_STATE "Push D3D render/texture-state methods to the GPU (OFF: mirror and device-field updates only)" ON)
-option(HALO_STANDALONE_AUDIO "Mix PCM/Xbox ADPCM through nxdk's stereo AC97 output" ON)
-set(HALO_STANDALONE_AUDIO_BACKEND "software" CACHE STRING "Audio backend: software or apu (experimental nxdk-audio)")
+option(HALO_STANDALONE_AUDIO "Play PCM/Xbox ADPCM through the selected stereo audio backend" ON)
+set(HALO_STANDALONE_AUDIO_BACKEND "apu" CACHE STRING "Audio backend: apu (experimental nxdk-audio) or software")
 set_property(CACHE HALO_STANDALONE_AUDIO_BACKEND PROPERTY STRINGS software apu)
 if(NOT HALO_STANDALONE_AUDIO_BACKEND MATCHES "^(software|apu)$")
 	message(FATAL_ERROR "HALO_STANDALONE_AUDIO_BACKEND must be software or apu")
@@ -105,6 +105,7 @@ set(STANDALONE_COMPAT_SOURCES
 	compat/xapi_fileio.c
 	compat/xapi_heap.c
 	compat/xapi_input.c
+	compat/xapi_keyboard.c
 	compat/crt_string.c
 	compat/crt_stdio.c
 	compat/crt_wprintf.c
@@ -120,7 +121,7 @@ set(STANDALONE_COMPAT_SOURCES
 if(HALO_STANDALONE_AUDIO)
 	list(APPEND STANDALONE_COMPAT_SOURCES compat/dsound_nxdk.c)
 else()
-	list(APPEND STANDALONE_COMPAT_SOURCES compat/dsound_silent.c)
+	list(APPEND STANDALONE_COMPAT_SOURCES compat/dsound_silent.c compat/dsound_stream_controls.c)
 endif()
 list(TRANSFORM STANDALONE_COMPAT_SOURCES PREPEND "${CMAKE_CURRENT_LIST_DIR}/")
 add_library(halo OBJECT "${gen_dir}/build_info.c" "${CMAKE_CURRENT_LIST_DIR}/standalone_runtime.c"

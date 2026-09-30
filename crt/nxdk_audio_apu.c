@@ -82,6 +82,15 @@ failed_lock:
     return failed();
 }
 
+/* Master gain stays at the driver's unity default; the adapter's combined
+ * volume/headroom/3D level and pan go to the front bins. A stereo voice maps its
+ * left and right samples to those bins. */
+static int set_gain(struct apu_voice *h)
+{
+    return nxAudioVoiceSetChannelGain(&h->hardware, (float)h->voice->gain_left / 32768.0f,
+                                      (float)h->voice->gain_right / 32768.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+}
+
 static int make_voice(struct apu_voice *h)
 {
     const struct audio_format *f = &h->voice->format;
@@ -99,7 +108,7 @@ static int make_voice(struct apu_voice *h)
     h->owners[0] = h->owners[1] = -1;
     halo_audio_apu_stats[1]++;
     nxAudioBufferSetCallback(&h->hardware, buffer_consumed, h);
-    if (!nxAudioVoiceSetMasterGain(&h->hardware, (float)h->voice->gain_left / 32768.0f) ||
+    if (!set_gain(h) ||
         !nxAudioVoiceSetPitch(&h->hardware, (float)h->frequency / (float)f->rate)) {
         nxAudioVoiceDestroy(&h->hardware);
         h->valid = 0;
@@ -211,16 +220,17 @@ static void pump(struct apu_voice *h)
     for (i = 0; i < AUDIO_PACKET_COUNT; i++) {
         unsigned int packet = (v->read_packet + i) % AUDIO_PACKET_COUNT;
         if (v->packets[packet].state != 1 || owned(h, packet)) continue;
-        for (slot = 0; slot < 2; slot++)
-            if (h->owners[slot] < 0) break;
-        if (slot == 2) break;
+        /* Preserve the driver's A/B FIFO order even if the other slot is
+         * free. A busy next slot means wait, not abort this Halo packet. */
+        slot = h->hardware.next_ssl_index;
+        if (h->owners[slot] >= 0) break;
         if (!nxAudioBufferQueue(&h->hardware, &h->buffers[packet])) {
             v->packets[packet].result = AUDIO_ABORTED;
             v->packets[packet].state = 2;
             failed();
             continue;
         }
-        /* The driver chooses its first free SSL slot. */
+        /* The driver advances its next SSL only after successful queueing. */
         for (slot = 0; slot < 2; slot++)
             if (h->hardware.buffers_hardware[slot] == &h->buffers[packet]) break;
         if (slot < 2) h->owners[slot] = (int)packet;
@@ -278,7 +288,7 @@ void audio_output_poll(struct audio_voice *v)
 int audio_output_volume(struct audio_voice *v)
 {
     struct apu_voice *h = v->backend;
-    return !h->valid || nxAudioVoiceSetMasterGain(&h->hardware, (float)v->gain_left / 32768.0f) || failed();
+    return !h->valid || set_gain(h) || failed();
 }
 
 int audio_output_frequency(struct audio_voice *v, unsigned int frequency)

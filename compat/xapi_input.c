@@ -83,13 +83,17 @@ standalone_xid_device *usbh_xid_get_device_list(void);
 int usbh_xid_read(standalone_xid_device *device, uint8_t endpoint, void *callback);
 int usbh_int_xfer(standalone_usb_transfer *transfer);
 int usbh_xid_rumble(standalone_xid_device *device, uint16_t left, uint16_t right);
+void standalone_keyboard_usb_init(void);
+int standalone_keyboard_usb_refresh(void);
+void standalone_keyboard_push(const uint8_t *report);
 
 #define USBH_OK 0
 #define ERROR_SUCCESS_CODE 0
-#define ERROR_HANDLE_EOF_CODE 0x26
 #define ERROR_DEVICE_NOT_CONNECTED_CODE 0x48f
 #define XID_REPORT_BYTES 32
 #define XID_GAMEPAD_TYPE 1
+#define XID_DEBUG_KEYBOARD_TYPE 2
+#define KEYBOARD_REPORT_BYTES 8
 #define XDEVICE_GAMEPAD_ADDRESS 0x24b29c
 #define XDEVICE_MEMORY_UNIT_ADDRESS 0x24b218
 #define XDEVICE_DEBUG_KEYBOARD_ADDRESS 0x24b2a8
@@ -119,6 +123,10 @@ typedef struct standalone_input_slot {
 static standalone_input_slot input_slots[MAXIMUM_GAMEPADS];
 static uint32_t input_connected_mask;
 static uint32_t input_reported_mask;
+/* The debug keyboard is always port 0; compat/xapi_keyboard.c owns its
+   keystroke queue, so the handle is only a non-null token for Halo. */
+static uint32_t keyboard_reported_mask;
+static uint8_t keyboard_handle;
 static int input_initialized;
 
 static int input_port_from_device(standalone_xid_device *device)
@@ -173,6 +181,36 @@ static void input_read_complete(standalone_usb_transfer *transfer)
   }
 }
 
+/* XID debug keyboard reports carry no XID header: modifiers, reserved and six
+   HID usages, the USB boot keyboard layout (xemu hw/xbox/xid-keyboard.c). */
+static void keyboard_read_complete(standalone_usb_transfer *transfer)
+{
+  if (transfer->status < 0 || transfer->transfer_length < KEYBOARD_REPORT_BYTES) {
+    return;
+  }
+  standalone_keyboard_push(transfer->buffer);
+  transfer->transfer_length = 0;
+  transfer->done = 0;
+  if (usbh_int_xfer(transfer) != USBH_OK) {
+    transfer->done = 1;
+  }
+}
+
+/* Returns 1 while an XID debug keyboard is attached and keeps its read armed.
+   The caller has polled the hubs. */
+static int keyboard_refresh_xid(void)
+{
+  standalone_xid_device *device;
+
+  for (device = usbh_xid_get_device_list(); device != NULL; device = device->next) {
+    if (device->descriptor.type == XID_DEBUG_KEYBOARD_TYPE) {
+      usbh_xid_read(device, 0, keyboard_read_complete);
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static void input_refresh_devices(void)
 {
   standalone_xid_device *device;
@@ -213,6 +251,7 @@ static void input_initialize_once(void)
   }
   compat_memset(input_slots, 0, sizeof(input_slots));
   usbh_core_init();
+  standalone_keyboard_usb_init();
   usbh_xid_init();
   for (i = 0; i < 500; i++) {
     usbh_pooling_hubs();
@@ -238,10 +277,6 @@ int __stdcall standalone_XInputGetState(void *handle, standalone_xinput_state *s
 int __stdcall standalone_XInputSetState(void *handle, void *feedback)
     __asm__("_XInputSetState@8");
 uint32_t __stdcall standalone_XGetDevices(void *type) __asm__("_XGetDevices@4");
-int __stdcall standalone_XInputDebugInitKeyboardQueue(void *parameters)
-    __asm__("_FUN_00252d73@4");
-int __stdcall standalone_XInputDebugGetKeystroke(void *keystroke)
-    __asm__("_FUN_00252ad9@4");
 
 void __stdcall standalone_XInitDevices(uint32_t count, void *types)
 {
@@ -263,6 +298,15 @@ int __stdcall standalone_XGetDeviceChanges(void *type, uint32_t *insertions,
   input_initialize_once();
   *insertions = 0;
   *removals = 0;
+  if ((uint32_t)type == XDEVICE_DEBUG_KEYBOARD_ADDRESS) {
+    usbh_pooling_hubs();
+    changed = (uint32_t)(standalone_keyboard_usb_refresh() | keyboard_refresh_xid()) ^
+              keyboard_reported_mask;
+    *insertions = changed & ~keyboard_reported_mask;
+    *removals = changed & keyboard_reported_mask;
+    keyboard_reported_mask ^= changed;
+    return changed != 0;
+  }
   if ((uint32_t)type != XDEVICE_GAMEPAD_ADDRESS) {
     return 0;
   }
@@ -280,6 +324,9 @@ void *__stdcall standalone_XInputOpen(void *type, uint32_t port, uint32_t slot,
   (void)slot;
   (void)parameters;
   input_initialize_once();
+  if ((uint32_t)type == XDEVICE_DEBUG_KEYBOARD_ADDRESS) {
+    return port == 0 && keyboard_reported_mask ? &keyboard_handle : NULL;
+  }
   input_refresh_devices();
   if ((uint32_t)type != XDEVICE_GAMEPAD_ADDRESS || port >= MAXIMUM_GAMEPADS ||
       !input_slots[port].connected) {
@@ -361,17 +408,8 @@ uint32_t __stdcall standalone_XGetDevices(void *type)
     input_refresh_devices();
     return input_connected_mask;
   }
+  if ((uint32_t)type == XDEVICE_DEBUG_KEYBOARD_ADDRESS) {
+    return keyboard_reported_mask;
+  }
   return 0;
-}
-
-int __stdcall standalone_XInputDebugInitKeyboardQueue(void *parameters)
-{
-  (void)parameters;
-  return ERROR_SUCCESS_CODE;
-}
-
-int __stdcall standalone_XInputDebugGetKeystroke(void *keystroke)
-{
-  (void)keystroke;
-  return ERROR_HANDLE_EOF_CODE;
 }

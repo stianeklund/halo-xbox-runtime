@@ -59,6 +59,70 @@
      }
  
      const uint32_t notifier_idx =
+@@ -249,39 +255,39 @@
+     }
+ 
+     const KIRQL irql = KeRaiseIrqlToDpcLevel();
++    /* Hardware alternates A/B, including after an empty interval. Filling
++     * the first free slot can send newer audio ahead of an older packet. */
++    const uint8_t buffer_index = voice->next_ssl_index;
++    if (voice->buffers_hardware[buffer_index] != NULL) {
++        KfLowerIrql(irql);
++        apu_set_last_error(NX_AUDIO_ERR_QUEUE_FULL);
++        return false;
++    }
+ 
+     voice->streaming = true;
+     voice->cfg_fmt |= APU_MAKE_VALUE(NV_PAVS_VOICE_CFG_FMT_DATA_TYPE, 1);
+ 
+-    apu_wait_for_pio(4);
++    /* IRQL excludes the CPU's DPC; VOICE_LOCK also excludes the APU while
++     * resetting the notifier and publishing descriptors for an empty slot. */
++    apu_wait_for_pio(3);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_FMT, voice->cfg_fmt);
++
++    MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, FALSE);
++    if (!insert_buffer_to_ssl(voice, buffer, buffer_index)) {
++        MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, TRUE);
++        apu_wait_for_pio(1);
++        apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
++        KfLowerIrql(irql);
++        return false;
++    }
++    voice->buffers_hardware[buffer_index] = buffer;
++    voice->next_ssl_index ^= 1;
++    apu_wait_for_pio(1);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
+-
+-    uint8_t buffer_index = 0xFF;
+-    for (uint8_t j = 0; j < 2; j++) {
+-        if (voice->buffers_hardware[j] == NULL) {
+-            buffer_index = j;
+-            break;
+-        }
+-    }
+-
+-    if (buffer_index < 2) {
+-        MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, FALSE);
+-        if (!insert_buffer_to_ssl(voice, buffer, buffer_index)) {
+-            MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, TRUE);
+-            KfLowerIrql(irql);
+-            return false;
+-        }
+-        voice->buffers_hardware[buffer_index] = buffer;
+-        KfLowerIrql(irql);
+-        return true;
+-    }
+-
+     KfLowerIrql(irql);
+-    apu_set_last_error(NX_AUDIO_ERR_QUEUE_FULL);
+-    return false;
++    return true;
+ }
+ 
+ bool nxAudioBufferSubmit (nxAudioVoice *voice, const nxAudioBuffer *buffer)
 @@ -311,6 +317,7 @@
          }
      }
@@ -100,7 +164,13 @@
  }
  
  bool nxAudioVoiceCreate (nxAudioVoice *voice, const nxAudioFormat *format)
-@@ -427,6 +431,7 @@
+@@ -347,2 +351,3 @@
+-    // Add a 6 dB floor preserving headroom in the mixbin accumulator when many voices sum together.
+-    const float total_db = attenuation_db + 6.0f;
++    // Halo's DirectSound adapter includes the reference voice headroom.
++    // Do not add another floor at both master and channel conversion.
++    const float total_db = attenuation_db;
+@@ -427,6 +432,7 @@
      voice->master_gain = gain;
      voice_update_volumes(voice);
  
@@ -282,3 +352,13 @@
 +
 +    return true;
 +}
+--- a/include/nxaudio.h
++++ b/include/nxaudio.h
+@@ -155,6 +155,7 @@
+ 
+     // Maintain a local copy of some hardware variables
+     uint8_t voice_index;
++    uint8_t next_ssl_index; // FIFO order across empty streaming intervals; uses existing padding
+     uint32_t cfg_vbin;
+     uint32_t cfg_fmt;
+     uint32_t cfg_env0;

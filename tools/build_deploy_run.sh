@@ -3,12 +3,17 @@
 # counterpart of halo/tools/xbox/build_deploy_run.sh.
 #
 #   tools/build_deploy_run.sh [--xbox HOST] [--native-xbdm] [--watch SECONDS]
-#                             [--no-launch] [-- BUILD_ARGS...]
+#                             [--no-launch] [--init FILE | --no-init]
+#                             [-- BUILD_ARGS...]
 #
 #   --xbox HOST      XBDM host (default: $XBOX_HOST or 127.0.0.1)
 #   --native-xbdm    bridged xemu: keep XBDM traffic native (HALO_NATIVE_XBDM=1)
 #   --watch SECONDS  launch through xbdm_boot_watch.py and stream debug output
 #   --no-launch      upload only
+#   --init FILE      console commands uploaded as init.txt next to the XBE
+#                    (default: tools/deploy_init.txt, which enables
+#                    rasterizer_stats for the FPS display)
+#   --no-init        leave the title directory's init.txt untouched
 #   BUILD_ARGS       passed to build.sh (seed|apu|standalone|nogpu, --fresh,
 #                    --inventory); -q/--quiet hides build output unless it fails
 #
@@ -25,6 +30,7 @@ PYTHON="${PYTHON:-/usr/bin/python3}"
 xbox_host="${XBOX_HOST:-127.0.0.1}"
 build_args=()
 quiet=0 launch=1 watch=0 variant=seed
+init_file="$here/tools/deploy_init.txt"
 
 log() {
   printf '[build_deploy_run][%s] %s\n' "$(date '+%H:%M:%S')" "$*"
@@ -56,8 +62,20 @@ while (($#)); do
       launch=0
       shift
       ;;
+    --init)
+      if (($# < 2)); then
+        printf 'error: --init requires a file\n' >&2
+        exit 2
+      fi
+      init_file="$2"
+      shift 2
+      ;;
+    --no-init)
+      init_file=""
+      shift
+      ;;
     -h|--help)
-      sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     --)
@@ -136,6 +154,17 @@ if ! rdcp --timeout 60 --sendfile "$map" "$map_title"; then
   exit 1
 fi
 
+# Halo runs d:\init.txt as console commands at startup. This replaces any
+# init.txt already in the title directory.
+init_title="${xbox_title%\\*}\\init.txt"
+if [[ -n "$init_file" ]]; then
+  log "uploading ${init_file} -> ${init_title}"
+  if ! rdcp --timeout 60 --sendfile "$init_file" "$init_title"; then
+    log "init.txt upload failed"
+    exit 1
+  fi
+fi
+
 if ((!launch)); then
   log "done (not launched)"
   exit 0
@@ -150,7 +179,9 @@ if [[ "$watch" != 0 ]]; then
 fi
 
 log "launching ${xbox_title}"
-if ! rdcp "magicboot title=${xbox_title}"; then
+# Without "debug" the title boots without XBDM attached and later queries
+# (audio_status.py, crash reports) see the connection closed.
+if ! rdcp "magicboot title=${xbox_title} debug"; then
   log "launch failed"
   exit 1
 fi

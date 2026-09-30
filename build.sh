@@ -3,7 +3,7 @@
 #
 #   ./build.sh [seed|apu|standalone|nogpu] [--fresh] [--inventory] [--deploy]
 #
-#   seed        (default) seeded bring-up build -> build-seed/default.xbe
+#   seed        (default) seeded APU bring-up build -> build-seed/default.xbe
 #   apu         seeded nxdk-audio prototype -> build-apu/default.xbe
 #   standalone  no seeded data (does not boot yet) -> build/default.xbe
 #   nogpu       seeded, HALO_STANDALONE_GPU_STATE=OFF -> build-nogpu/default.xbe
@@ -14,8 +14,9 @@
 # HALO_ROOT picks the halo checkout or worktree to build (default ../halo),
 # e.g. HALO_ROOT=/mnt/g/dev/halo-wt ./build.sh.  Switching it reuses the same
 # build directory and recompiles the game sources from the new tree.
+# Audio defaults to APU; HALO_STANDALONE_AUDIO_BACKEND=software selects fallback.
 #
-# Overridable environment: NXDK_DIR, HALO_ROOT, HALO_SEED_XBE, PYTHON, XBOX_HOST, XBOX_TITLE, JOBS.
+# Overridable environment: NXDK_DIR, HALO_ROOT, HALO_SEED_XBE, PYTHON, XBOX_HOST, XBOX_TITLE, JOBS, HALO_STANDALONE_AUDIO_BACKEND.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +33,7 @@ for arg in "$@"; do
 		--fresh) fresh=(--fresh) ;;
 		--inventory) inventory=1 ;;
 		--deploy) deploy=1 ;;
-		-h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		-h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		*) echo "unknown argument: $arg" >&2; exit 2 ;;
 	esac
 done
@@ -51,7 +52,7 @@ case "$variant" in
 	standalone) build="$here/build";       opts=(-DHALO_STANDALONE_SEED_XBE= -DHALO_STANDALONE_GPU_STATE=ON) ;;
 	apu)        build="$here/build-apu";   opts=(-DHALO_STANDALONE_SEED_XBE="$seed_xbe" -DHALO_STANDALONE_GPU_STATE=ON -DHALO_STANDALONE_AUDIO=ON) ;;
 esac
-audio_backend=software
+audio_backend="${HALO_STANDALONE_AUDIO_BACKEND:-apu}"
 title_name=standalone_seed.xbe
 if [ "$variant" = apu ]; then
 	audio_backend=apu

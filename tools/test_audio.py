@@ -160,9 +160,41 @@ class AudioImage:
         self.service()
         assert stream in self.freed
 
+    def initialize_channel(self, flags, index):
+        # The game's lift can inline channel_get and checks the global count.
+        channel = 0x4fdfc8 + index * 0x74
+        self.uc.mem_write(channel, bytes(0x74))
+        self.uc.mem_write(0x4fdfc4, struct.pack("<h", index + 1))
+        self.uc.mem_write(0x4fdbc0, b"\x00")
+        self.uc.mem_write(0x505488, struct.pack("<f", 1.0))  # pause gain
+        assert self.call("_dsound_initialize_channel", flags, index) & 255 == 1
+        return channel, self.words(channel + 0x70)[0]
+
+    def channel_gain(self, index, gain):
+        properties = self.alloc(struct.pack("<8f", 1, 1, 1, gain, 0, 0, 0, 0))
+        self.call("_sound_dsound_update_channel_properties", properties, index, 0)
+
 
 def pcm(*samples):
     return struct.pack("<" + "h" * len(samples), *samples)
+
+
+def output_samples(samples):
+    # Reference DirectSound headroom for ordinary 2D voices.
+    gain = int(32768 * 10 ** (-6 / 20))
+    return tuple(max(-32768, min(32767, int(sample * gain / 32768)))
+                 for sample in samples)
+
+
+def test_output_clipping(build):
+    image = AudioImage(build)
+    samples = (32767, -32768, 60000, -60000, 200000, -200000,
+               2147483647, -2147483648, 0, 0)
+    mixed = image.alloc(struct.pack("<10i", *samples))
+    output = image.alloc(bytes(20))
+    image.call("_audio_mix_clip", mixed, output, 5)
+    assert struct.unpack("<10h", image.uc.mem_read(output, 20)) == (
+        32767, -32768, 32767, -32768, 32767, -32768, 32767, -32768, 0, 0)
 
 
 def test_stream_lifecycle(build):
@@ -173,7 +205,7 @@ def test_stream_lifecycle(build):
     assert result == 0 and image.words(status)[0] == 0x8000000a
     inner, = image.words(stream + 0x24)
     assert image.words(inner + 8)[0] == 2
-    assert image.render(4) == (1200, 1200, -1200, -1200, 32767, 32767, -32768, -32768)
+    assert image.render(4) == output_samples((1200, 1200, -1200, -1200, 32767, 32767, -32768, -32768))
     assert image.words(inner + 8)[0] == 0
     assert image.callbacks == [] and image.words(done)[0] == 0
     image.service()
@@ -195,7 +227,7 @@ def test_capacity_flush_pause(build):
     assert image.call("_IDirectSoundStream_Pause@8", stream, 1) == 0
     assert image.render(4) == (0,) * 8
     assert image.call("_IDirectSoundStream_Pause@8", stream, 0) == 0
-    assert image.render(1) == (100, 100)
+    assert image.render(1) == output_samples((100, 100))
     # Thiscall inner slot 4 is the stop path used by Halo (ECX=this, RET 8).
     from unicorn.x86_const import UC_X86_REG_ECX
     inner, = image.words(stream + 0x24)
@@ -208,7 +240,7 @@ def test_capacity_flush_pause(build):
     assert image.callbacks == [(42, i, 0x80004004) for i in range(4)]
     assert image.words(packets[0][1])[0] == 2
     assert image.submit(stream, pcm(321))[0] == 0
-    assert image.render(1) == (321, 321)
+    assert image.render(1) == output_samples((321, 321))
     image.service()
     image.release(stream)
 
@@ -217,36 +249,38 @@ def test_resampling_volume_mix(build):
     image = AudioImage(build)
     stream = image.stream(image.format(rate=24000))
     assert image.submit(stream, pcm(1000, 2000))[0] == 0
-    assert image.render(4) == (1000, 1000, 1000, 1000, 2000, 2000, 2000, 2000)
+    assert image.render(4) == output_samples((1000, 1000, 1000, 1000, 2000, 2000, 2000, 2000))
     image.service()
     assert image.call("_IDirectSoundStream_SetFrequency@8", stream, 48000) == 0
     assert image.call("_IDirectSoundStream_SetVolume@8", stream, -600) == 0
     assert image.submit(stream, pcm(10000))[0] == 0
     sample = image.render(1)[0]
-    assert 5010 <= sample <= 5012
+    assert 2511 <= sample <= 2512
     image.service()
     assert image.call("_IDirectSoundStream_SetVolume@8", stream, -10000) == 0
     assert image.submit(stream, pcm(30000))[0] == 0
     assert image.render(1) == (0, 0)
     image.service()
     image.release(stream)
-    # Saturation across simultaneous voices and unsigned 8-bit PCM.
+    # Two loud voices fit within output headroom without premature clipping.
     a, b = image.stream(), image.stream()
     image.submit(a, pcm(30000, -30000))
     image.submit(b, pcm(30000, -30000))
-    assert image.render(2) == (32767, 32767, -32768, -32768)
+    # Each voice applies and truncates its own headroom before summation.
+    assert image.render(2) == tuple(2 * value for value in
+                                   output_samples((30000, 30000, -30000, -30000)))
     image.service()
     image.release(a)
     image.release(b)
     c = image.stream(image.format(bits=8))
     image.submit(c, bytes([0, 128, 255]))
-    assert image.render(3) == (-32768, -32768, 0, 0, 32512, 32512)
+    assert image.render(3) == output_samples((-32768, -32768, 0, 0, 32512, 32512))
     image.service()
     image.release(c)
     # Resampler overshoot must carry through several tiny packets.
     fast = image.stream(image.format(rate=192000))
     for i in range(4): image.submit(fast, pcm(i + 1), i)
-    assert image.render(1) == (1, 1)
+    assert image.render(1) == output_samples((1, 1))
     image.service()
     assert [c[1] for c in image.callbacks[-4:]] == list(range(4))
     image.release(fast)
@@ -258,7 +292,7 @@ def test_adpcm(build):
     block = struct.pack("<hBB", 100, 0, 0) + b"\x11" * 31 + b"\xf1"
     assert image.submit(mono, block)[0] == 0
     rendered = image.render(64)
-    assert rendered[::2] == tuple(range(100, 164)) and rendered[1::2] == rendered[::2]
+    assert rendered[::2] == output_samples(range(100, 164)) and rendered[1::2] == rendered[::2]
     image.service()
     image.release(mono)
     stereo = image.stream(image.format(channels=2, adpcm=True))
@@ -266,8 +300,8 @@ def test_adpcm(build):
     block += (b"\x11" * 4 + b"\x99" * 4) * 8
     assert image.submit(stereo, block + block)[0] == 0
     rendered = image.render(128)
-    assert rendered[::2] == tuple(range(1000, 1064)) * 2
-    assert rendered[1::2] == tuple(range(-1000, -1064, -1)) * 2
+    assert rendered[::2] == output_samples(range(1000, 1064)) * 2
+    assert rendered[1::2] == output_samples(range(-1000, -1064, -1)) * 2
     image.service()
     bad = bytearray(block)
     bad[2] = 89
@@ -285,20 +319,20 @@ def test_static_buffer(build):
     data = image.alloc(pcm(100, -100, 200, -200, 300, -300))
     assert image.call("_IDirectSoundBuffer_SetBufferData@12", buffer, data, 12) == 0
     assert image.call("_IDirectSoundBuffer_Play@16", buffer, 0, 0, 0) == 0
-    assert image.render(4) == (100, -100, 200, -200, 300, -300, 0, 0)
+    assert image.render(4) == output_samples((100, -100, 200, -200, 300, -300, 0, 0))
     status = image.alloc(bytes(4))
     image.call("_IDirectSoundBuffer_GetStatus@8", buffer, status)
     assert image.words(status)[0] == 0
     image.call("_IDirectSoundBuffer_SetCurrentPosition@8", buffer, 0)
     image.call("_IDirectSoundBuffer_SetLoopRegion@12", buffer, 4, 8)
     image.call("_IDirectSoundBuffer_Play@16", buffer, 0, 0, 1)
-    assert image.render(6) == (100, -100, 200, -200, 300, -300, 200, -200, 300, -300, 200, -200)
+    assert image.render(6) == output_samples((100, -100, 200, -200, 300, -300, 200, -200, 300, -300, 200, -200))
     image.call("_IDirectSoundBuffer_Stop@4", buffer)
     assert image.render(2) == (0,) * 4
     image.call("_IDirectSoundBuffer_SetCurrentPosition@8", buffer, 0)
     assert image.call("_IDirectSoundBuffer_SetPitch@8", buffer, 4096) == 0
     image.call("_IDirectSoundBuffer_Play@16", buffer, 0, 0, 0)
-    assert image.render(2) == (100, -100, 300, -300)
+    assert image.render(2) == output_samples((100, -100, 300, -300))
     assert image.call("_IDirectSoundBuffer_SetLoopRegion@12", buffer, 8, 8) == 0x80070057
     assert image.call("_IDirectSoundBuffer_Release@4", buffer) == 0
     image.service()
@@ -310,7 +344,7 @@ def test_event_and_release(build):
     stream = image.stream(callback=False, capacity=1)
     assert image.submit(stream, pcm(700), 123)[0] == 0
     assert image.submit(stream, pcm(800), 124)[0] == 0x80070057
-    assert image.render(1) == (700, 700)
+    assert image.render(1) == output_samples((700, 700))
     assert image.submit(stream, pcm(800), 124)[0] == 0x80070057
     image.service()
     assert image.events == [123]
@@ -332,7 +366,7 @@ def test_validation_and_reentrant_callbacks(build):
     assert image.submit(stream, b"\x01")[0] == 0x80070057
     image.submit(stream, pcm(10), 1)
     image.submit(stream, pcm(20), 2)
-    assert image.render(2) == (10, 10, 20, 20)
+    assert image.render(2) == output_samples((10, 10, 20, 20))
     # Releasing from a completion callback must allow recursive DoWork,
     # dispatch the remaining abort, and reclaim the object exactly once.
     release = image.words(image.words(stream)[0] + 4)[0]
@@ -352,11 +386,131 @@ def test_validation_and_reentrant_callbacks(build):
     assert image.render(1) == (0, 0)
 
 
+def test_game_channel_initialization(build, image_type=AudioImage, playback=None):
+    image = image_type(build)
+    controls = []
+    descriptions = []
+
+    def missing():
+        raise AssertionError("game initialization reached a missing compatibility function")
+
+    def describe_stream():
+        _, desc, _, _ = image.args(4)
+        flags, capacity, format_address, callback, context, _ = image.words(desc, 6)
+        format_fields = struct.unpack("<HHIIHHHH", image.uc.mem_read(format_address, 20))
+        descriptions.append((flags, capacity, callback, context, format_fields))
+
+    image.hooks[image.symbols["_halo_standalone_missing"]] = missing
+    image.hooks[image.symbols["_display_assert"]] = missing
+    image.hooks[image.symbols["_IDirectSound_CreateSoundStream@16"]] = describe_stream
+    image.hooks[image.symbols["_FUN_001ca970@12"]] = image.completed
+    for name, size in (("SetMixBins", 8), ("SetMixBinVolumes_12", 12),
+                       ("SetMode", 12), ("SetPosition", 20), ("SetVelocity", 20),
+                       ("SetConeOrientation", 20), ("SetMinDistance", 12),
+                       ("SetMaxDistance", 12), ("SetConeAngles", 16),
+                       ("SetConeOutsideVolume", 12), ("SetAllParameters", 12)):
+        image.hooks[image.symbols[f"_IDirectSoundStream_{name}@{size}"]] = (
+            lambda name=name: controls.append(name))
+
+    for index, flags in enumerate((0, 2, 8, 9, 10, 12, 13, 14)):
+        controls.clear()
+        channel, stream = image.initialize_channel(flags, index)
+        assert stream and struct.unpack("<h", image.uc.mem_read(channel + 2, 2))[0] == -1
+        stream_flags, capacity, callback, context, fmt = descriptions[-1]
+        assert (stream_flags, capacity, callback, context) == (
+            0x10 if flags & 1 else 0, 4, image.symbols["_FUN_001ca970@12"], index)
+        tag, channels, rate, _, align, bits, extra, samples = fmt
+        if flags & 8:
+            assert (tag, channels, rate, align, bits, extra, samples) == (
+                0x69, 2 if flags & 2 else 1, 44100 if flags & 4 else 22050,
+                72 if flags & 2 else 36, 4, 2, 64)
+        else:
+            assert (tag, channels, align, bits) == (1, 2, 4, 16)
+        if flags & 1:
+            assert set(controls) == {"SetMode", "SetPosition", "SetVelocity",
+                                     "SetConeOrientation", "SetMinDistance", "SetMaxDistance",
+                                     "SetConeAngles", "SetConeOutsideVolume", "SetAllParameters"}
+        else:
+            assert controls == ([] if flags & 2 else ["SetMixBins", "SetMixBinVolumes_12"])
+        # Check the lift's initial mute, then the game's unity gain/pitch update.
+        # Halo routes 2D channels without the stereo bit at -602 mB per bin.
+        block = struct.pack("<hBB", 500, 0, 0) * channels + b"\x11" * (32 * channels)
+        payload = block if flags & 8 else pcm(500, 500)
+        bins = 0.5 if not flags & 3 else 1.0
+        for gain in (0.0, 1.0):
+            if gain:
+                image.channel_gain(index, gain)
+            result = image.submit(stream, payload, index)[0]
+            assert result == 0, (flags, fmt, hex(result))
+            if playback:
+                playback(image, stream, payload, gain * bins * (1.0 if flags & 1 else 10 ** (-6 / 20)))
+            else:
+                expected = ((250, 250) if bins < 1 else (500, 500)) if gain else (0, 0)
+                assert image.render(1) == (expected if flags & 1 else output_samples(expected))
+            assert image.method(stream, 6) == 0
+        image.release(stream)
+
+
+def test_spatial_gain(build, image_type=AudioImage, gains=None):
+    image = image_type(build)
+    if gains is None:
+        def gains(stream):
+            image.submit(stream, pcm(10000))
+            left, right = image.render(1)
+            image.service()
+            scale = 10000  # 3D voices have no default headroom.
+            return left / scale, right / scale
+    desc = image.alloc(struct.pack("<IIIIII", 0x10, 4, image.format(), image.callback, 42, 0))
+    out = image.alloc(bytes(4))
+    assert image.call("_DirectSoundCreateStream@12", desc, out, 0) == 0
+    stream, = image.words(out)
+    floats = lambda *values: [struct.unpack("<I", struct.pack("<f", v))[0] for v in values]
+    ds = 0
+    assert image.call("_IDirectSound_SetOrientation@32", ds, *floats(0, 0, 1, 0, 1, 0), 0) == 0
+    assert image.call("_IDirectSoundStream_SetMinDistance@12", stream, *floats(2.0), 1) == 0
+    # Deferred: no change until the per-frame commit.
+    assert image.call("_IDirectSoundStream_SetPosition@20", stream, *floats(0, 0, 8), 1) == 0
+    assert gains(stream) == (1.0, 1.0)
+    assert image.call("_IDirectSound_CommitDeferredSettings@4", ds) == 0
+    left, right = gains(stream)
+    assert abs(left - 0.25) < 0.001 and left == right, (left, right)
+    # Max distance clamps attenuation; rolloff scales it.
+    assert image.call("_IDirectSoundStream_SetMaxDistance@12", stream, *floats(4.0), 0) == 0
+    assert abs(gains(stream)[0] - 0.5) < 0.001
+    assert image.call("_IDirectSound_SetRolloffFactor@12", ds, *floats(0.0), 0) == 0
+    assert gains(stream) == (1.0, 1.0)
+    assert image.call("_IDirectSound_SetRolloffFactor@12", ds, *floats(1.0), 0) == 0
+    # A source on the listener's right shades the left ear.
+    assert image.call("_IDirectSoundStream_SetPosition@20", stream, *floats(2, 0, 0), 0) == 0
+    left, right = gains(stream)
+    assert right == 1.0 and abs(left - 0.3) < 0.001, (left, right)
+    # Disabled 3D and the listener moving on top of it both restore unity.
+    assert image.call("_IDirectSound_SetPosition@20", ds, *floats(2, 0, 0), 0) == 0
+    assert gains(stream) == (1.0, 1.0)
+    assert image.call("_IDirectSoundStream_SetPosition@20", stream, *floats(100, 0, 0), 0) == 0
+    assert image.call("_IDirectSoundStream_SetMode@12", stream, 2, 0) == 0
+    assert gains(stream) == (1.0, 1.0)
+    # I3DL2 direct level plus occlusion at its low-frequency ratio: -600 + -1000 * 0.2.
+    params = image.alloc(struct.pack("<iiiififif", -600, 0, 0, 0, 0.0, -10000, 0.0, -1000, 0.2))
+    assert image.call("_IDirectSoundStream_SetAllParameters@12", stream, params, 0) == 0
+    left, right = gains(stream)
+    assert abs(left - 0.3981) < 0.002 and left == right, (left, right)
+    # Volume combines with the 3D level; mix bins select the stereo sides.
+    assert image.call("_IDirectSoundStream_SetVolume@8", stream, -10000) == 0
+    assert gains(stream) == (0.0, 0.0)
+    assert image.call("_IDirectSoundStream_SetVolume@8", stream, 0) == 0
+    volumes = image.alloc(struct.pack("<iii", -10000, 0, -10000))
+    assert image.call("_IDirectSoundStream_SetMixBinVolumes_12@12", stream, 7, volumes) == 0
+    left, right = gains(stream)
+    assert left == 0.0 and abs(right - 0.3981) < 0.002
+    assert image.call("_IDirectSoundStream_SetMixBins@8", stream, 1) == 0
+    assert gains(stream) == (0.0, 0.0)
+    image.release(stream)
+
+
 def test_game_channel_packets(build):
     image = AudioImage(build)
-    channel = image.alloc(bytes(0x74))
     cache_refs = []
-    image.hooks[image.symbols["_sound_dsound_channel_get"]] = lambda: image.return_from_hook(channel)
     image.hooks[image.symbols["_FUN_001bdd70"]] = lambda: image.return_from_hook(0x10000000)
 
     def add_cache_ref():
@@ -367,9 +521,9 @@ def test_game_channel_packets(build):
     image.hooks[image.symbols["_FUN_001ca970@12"]] = image.completed
     # ADPCM mono, 22.05 kHz. Initialization must install a live per-channel
     # inner object and the game's callback; queueing splits two small blocks.
-    # C bool/boolean returns are in AL; upper EAX bits are unspecified.
-    assert image.call("_dsound_initialize_channel", 9, 7) & 255 == 1
-    stream, = image.words(channel + 0x70)
+    channel, stream = image.initialize_channel(9, 7)
+    # The lift starts muted; the game applies the sound's gain before playback.
+    image.channel_gain(7, 1.0)
     block = struct.pack("<hBB", 500, 0, 0) + b"\x11" * 32
     data = image.alloc(block * 2)
     permutation = image.alloc(bytes(0x44))
@@ -383,7 +537,7 @@ def test_game_channel_packets(build):
     assert image.call("_dsound_channel_queue_packet", 7) & 255 == 0
     assert cache_refs == [permutation, permutation]
     output = image.render(300)
-    assert output[:4] == (500, 500, 500, 500)
+    assert output[:4] == (500, 500, 500, 500)  # Type 9 is 3D.
     assert output[-2:] == (0, 0)
     image.service()
     assert image.callbacks == [(7, permutation, 0), (7, permutation, 0)]
@@ -426,8 +580,8 @@ def test_game_channel_reuse(build, image_type=AudioImage, advance=None):
 
     image.hooks[image.symbols["_FUN_001be100"]] = lambda: cache_ref(1)
     image.hooks[image.symbols["_FUN_001be140"]] = lambda: cache_ref(-1)
-    assert image.call("_dsound_initialize_channel", 8, 0) & 255 == 1
-    stream, = image.words(channel + 0x70)
+    channel, stream = image.initialize_channel(8, 0)
+    image.channel_gain(0, 1.0)
     block = struct.pack("<hBB", 500, 0, 0) + b"\x11" * 32
     data = image.alloc(block * 2)
     permutation = image.alloc(bytes(0x44))
@@ -446,7 +600,8 @@ def test_game_channel_reuse(build, image_type=AudioImage, advance=None):
         image.call("_FUN_001cb0c0", 0, permutation)
         assert pending() == 2 and refs[0] == 2
         if advance is None:
-            assert image.render(300 if shot % 2 else 1)[0] == 500
+            # Type 8 is 2D mono: Halo's mix bins play it at -602 mB per side.
+            assert image.render(300 if shot % 2 else 1)[0] == output_samples((250,))[0]
         else:
             advance(image, stream, shot)
         image.call("_sound_dsound_channel_release", 0)
@@ -501,7 +656,7 @@ def test_worker_without_spdif_callbacks(build):
     image.uc.emu_start(image.symbols["_audio_worker@4"], 0x30000000, count=2000000)
     assert len(queued) == 4 and len(waits) == 4
     assert [p[0] for p in queued] == buffers + buffers[:1]
-    assert all(samples == (500,) * 2048 for _, samples in queued)
+    assert all(samples == output_samples((500,) * 2048) for _, samples in queued)
     stats = image.words(image.symbols["_halo_audio_transport_stats"], 8)
     assert stats[0] == 0 and stats[1] == 4 and stats[5] == 1 and stats[6] == 4
     assert not image.locked
@@ -509,9 +664,11 @@ def test_worker_without_spdif_callbacks(build):
 
 if __name__ == "__main__":
     build = Path(sys.argv[1] if len(sys.argv) > 1 else "build-seed")
-    for test in (test_stream_lifecycle, test_capacity_flush_pause, test_resampling_volume_mix,
+    for test in (test_output_clipping, test_stream_lifecycle, test_capacity_flush_pause, test_resampling_volume_mix,
                  test_adpcm, test_static_buffer, test_event_and_release,
-                 test_validation_and_reentrant_callbacks, test_game_channel_packets,
+                 test_validation_and_reentrant_callbacks, test_game_channel_initialization,
+                 test_spatial_gain,
+                 test_game_channel_packets,
                  test_game_channel_reuse, test_dma_retirement, test_worker_without_spdif_callbacks):
         test(build)
         print(f"PASS {test.__name__}")

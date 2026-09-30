@@ -3,11 +3,15 @@
 The `apu` backend moves PCM/Xbox ADPCM decoding, resampling, and stereo voice
 mixing to the Xbox APU through [nxdk-audio](https://github.com/Ryzee119/nxdk-audio).
 It retains Halo's DirectSound ABI, packet callbacks, and synchronous flush
-behavior. The default remains `software` while this prototype is evaluated.
+behavior. APU is the default backend; software remains an explicit fallback.
 
-This milestone uses the driver's 192 2D voice slots. It does not yet implement
-Halo's listener/source positioning, distance/cone attenuation, Doppler, deferred
-3D updates, HRTF selection, surround mix bins, or I3DL2/DSP reverb. Halo's
+This milestone uses the driver's 192 2D voice slots. Both audible backends
+approximate DirectSound 3D in `compat/dsound_nxdk.c`: listener/source
+positions, inverse distance rolloff clamped at max distance, cones, deferred
+updates committed once per frame, the I3DL2 direct level with occlusion and
+obstruction at their low-frequency ratio, front mix-bin volumes, and a stereo
+pan with a head-shadow floor. It does not implement Doppler, HRTF filtering,
+high-frequency occlusion filtering, surround mix bins, or I3DL2/DSP reverb. Halo's
 `DownloadEffectsImage` data is not loaded into the upstream passthrough DSP.
 Bink movie audio also remains unsupported. This is not DirectSound feature parity.
 
@@ -40,7 +44,8 @@ cmake --build build-apu -j8
 ```
 
 `./build.sh apu --deploy` uploads `standalone_apu.xbe` by default. The `seed`
-variant continues to upload `standalone_seed.xbe`, allowing comparison and fallback.
+variant uploads `standalone_seed.xbe` and also defaults to APU. To build the
+software fallback, use `HALO_STANDALONE_AUDIO_BACKEND=software ./build.sh seed`.
 Both variants use seeded legacy data and remain bring-up builds.
 
 ## Ownership and completion
@@ -93,6 +98,18 @@ submission. It reproduces a redirected gain write against the previous build.
 This establishes the race and its correction; sustained environmental sounds
 still need an audible xemu retest to confirm the reported distortion is resolved.
 
+Streaming submissions now preserve hardware A/B FIFO order across empty
+intervals. The driver records the next SSL slot in an existing padding byte,
+so the pinned voice structure's size and existing field offsets stay unchanged.
+The adapter waits if that slot is still owned instead of aborting a packet or
+filling the other free slot. `VOICE_LOCK` stays held through descriptor/notifier
+publication and ownership assignment, preventing an empty-slot notification
+from racing a refill. The linked PCM/ADPCM regression covers repeated odd-length
+queue drains, a busy next slot, malformed descriptor rollback, and delayed
+completion; the previous driver publishes descriptors after unlocking and
+refills A when the APU is waiting for B. Audible dialogue validation remains
+separate from these ordering and ownership checks.
+
 The standalone shim generator also recognizes absolute archive/object symbols.
 Without this, its fallback replaces nxdk's `__tls_array = 4` with a function
 stub and crashes the first CRT thread before the game starts. APU linked tests
@@ -102,7 +119,7 @@ check that the TLS symbol retains its required value.
 
 ```bash
 python3 tools/test_audio_apu.py build-apu
-python3 tools/test_audio.py build-seed
+python3 tools/test_audio.py build-software
 python3 tools/audio_status.py build-apu/halo.map --host 127.0.0.1
 ```
 
@@ -114,6 +131,31 @@ static buffer play/loop/seek/stop/replay, and descriptor retirement/static-page
 pinning with the actual compiled driver DPC. The retirement assertion fails
 against the pre-fix driver. They do not emulate APU playback or establish audio fidelity.
 The software regression checks remain separate.
+
+The user traced audio stutter in xemu to its enabled DSP JIT. Disabling the
+DSP JIT removed the stutter in that session. This observation does not establish
+an audio-buffering defect in the title; real Xbox playback remains unverified.
+
+Gain staging now follows cachebeta's DirectSound voice defaults. Its original
+voice-settings constructor at `0x2054a8` sets 600 mB (6 dB) of headroom for
+ordinary 2D voices and zero for 3D voices; `SetVolume` subtracts that headroom
+before the hardware-volume calculation at `0x208000`. The adapter includes this
+once in the per-voice gain, including initial creation. The local driver patch
+removes upstream's implicit 6 dB floor from the gain converter, which previously
+applied it twice (master plus channel). Software output clips the summed voice
+samples without another global attenuation stage. Relative to the previous APU
+build, this raises ordinary 2D output by 6 dB and 3D output by 12 dB at the same
+requested volume. Explicit Halo mix-bin levels and spatial attenuation still
+apply, including its roughly -6 dB per-side routing for mono 2D sounds.
+
+A linked regression runs the actual driver gain setter and checks front-bin
+PIO attenuation at unity, -6 dB requested volume, and mute for both 2D and 3D
+voices. The previous linked build fails its default 2D check with 768 units
+(12 dB), where the reference default is 384 units (6 dB). This establishes the
+gain-staging correction; measured output parity with cachebeta still needs a
+comparison of the same audio segment and capture settings. AC97 PCM output
+remains at the upstream `0x0808` setting, and the passthrough DSP still lacks
+Halo's effects image.
 
 On 2026-09-30 the integrated title hit a transport initialization assertion
 before reaching audio. Networking was being changed independently, so the APU
@@ -140,9 +182,9 @@ A later attempt to validate the combined networking/APU title compiled and
 passed all seven APU regression groups, but the user reported a boot failure.
 The captured Halo log included a null read in `XFindClose` during network-game
 creation, followed by exception handling/rendering failures. The known audio
-test title was restored. Promotion of APU audio to the default is deferred
-until the integrated title passes its boot check; the networking worktree
-files remain owned by the separate networking effort. The software fallback
+test title was restored, and default promotion was deferred at that point.
+APU is now the requested default after subsequent integrated testing; audio-level
+comparisons and feature parity remain pending. The software fallback
 was rebuilt with the current networking sources and passed all eleven audio
 regression groups.
 
@@ -151,10 +193,10 @@ buffers, worker polls, stop timeouts, and driver errors. Software PCM peak/mixin
 counters are inactive with the APU backend. Read ordinary title RAM only;
 XBDM byte reads of AC97 registers previously crashed xemu.
 
-Before changing the default, compare rapid-fire effects, music, sustained streams,
+Continue comparing rapid-fire effects, music, sustained streams,
 pause/resume, and loud multi-voice scenes on xemu and real hardware. Measure
 levels against the reference title: upstream voice attenuation and AC97 volume
 settings differ from the software mixer, so copied volume values alone do not
-establish parity. Then implement listener/source/deferred 3D behavior, HRTF and
-Doppler, followed by the effects-image/mix-bin/I3DL2 path. Each milestone needs
+establish parity. Then compare the approximate 3D levels against the reference
+title and add HRTF and Doppler, followed by the effects-image/I3DL2 reverb path. Each milestone needs
 reference comparisons; successful packet tests are only lifecycle evidence.

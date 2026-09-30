@@ -8,7 +8,8 @@ import struct
 import sys
 from pathlib import Path
 
-from test_audio import AudioImage, pcm, test_game_channel_reuse
+from test_audio import (AudioImage, pcm, test_game_channel_reuse, test_game_channel_initialization,
+                        test_spatial_gain)
 
 
 class ApuImage(AudioImage):
@@ -27,7 +28,7 @@ class ApuImage(AudioImage):
             "nxAudioVoiceStop": self.stop_voice,
             "nxAudioVoiceStart": self.start_voice,
             "nxAudioVoicePause": self.pause_voice,
-            "nxAudioVoiceSetMasterGain": lambda: self.set_float("gain"),
+            "nxAudioVoiceSetChannelGain": self.set_channels,
             "nxAudioVoiceSetPitch": lambda: self.set_float("pitch"),
             "nxAudioBufferQueue": self.queue,
             "nxAudioBufferSubmit": self.attach,
@@ -61,10 +62,11 @@ class ApuImage(AudioImage):
 
     def create_voice(self):
         voice, format_address = self.args(2)
-        self.voices[voice] = {"destroyed": False, "queues": [], "gain": 1.0, "pitch": 1.0}
+        self.voices[voice] = {"destroyed": False, "queues": [], "gain": (1.0, 1.0), "pitch": 1.0}
         self.write(voice, 3)  # NX_STOPPED
         self.uc.mem_write(voice + 4, bytes(self.uc.mem_read(format_address, 16)))
         self.write(voice + 20, 0, 0)
+        self.uc.mem_write(voice + 137, b"\x00")  # next_ssl_index
         self.return_from_hook(1)
 
     def destroy_voice(self):
@@ -97,15 +99,25 @@ class ApuImage(AudioImage):
         self.voices[voice][key] = struct.unpack("<f", struct.pack("<I", raw))[0]
         self.return_from_hook(1)
 
+    def set_channels(self):
+        voice, *raw = self.args(7)
+        assert self.irql == 0, "gain work at DPC level"
+        gains = [struct.unpack("<f", struct.pack("<I", value))[0] for value in raw]
+        assert gains[2:] == [0.0] * 4, "adapter routed audio beyond the front bins"
+        self.voices[voice]["gain"] = tuple(gains[:2])
+        self.return_from_hook(1)
+
     def queue(self):
         voice, buffer = self.args(2)
         assert self.irql == 2
         slots = self.words(voice + 20, 2)
-        assert 0 in slots, "driver queue overflow"
+        slot = self.uc.mem_read(voice + 137, 1)[0]
+        assert slots[slot] == 0, "driver FIFO slot is still occupied"
         payload, size = self.words(buffer, 2)
         assert payload and size
         self.voices[voice]["queues"].append(bytes(self.uc.mem_read(payload, size)))
-        self.write(voice + 20 + 4 * slots.index(0), buffer)
+        self.write(voice + 20 + 4 * slot, buffer)
+        self.uc.mem_write(voice + 137, bytes([slot ^ 1]))
         self.return_from_hook(1)
 
     def attach(self):
@@ -195,6 +207,37 @@ def test_completion_before_next_process(build):
     image.release(stream)
 
 
+def test_reference_voice_headroom(build):
+    # Run the linked driver's gain conversion and inspect its real PIO writes.
+    # cachebeta 0x2054a8: 2D defaults to 600 mB; DS_CTRL3D defaults to zero.
+    for flags, headroom in ((0, 384), (0x10, 0)):
+        image = ApuImage(build)
+        desc = image.alloc(struct.pack("<6I", flags, 4, image.format(), image.callback, 42, 0))
+        out = image.alloc(bytes(4))
+        assert image.call("_DirectSoundCreateStream@12", desc, out, 0) == 0
+        stream, = image.words(out)
+        image.submit(stream, pcm(10000))
+        hardware = image.hardware(stream)
+        # Complete the voice defaults omitted by the lifecycle mock.
+        image.write(hardware + 36, 0x3f800000)  # master_gain = 1
+        image.write(hardware + 168, 0xffff)  # HRTF_NULL_HANDLE
+        image.hooks.pop(image.symbols["_nxAudioVoiceSetChannelGain"])
+        assert image.call("_audio_output_volume", stream + 0x38) == 1
+
+        def levels():
+            register = image.words(0xfe820360)[0]
+            return (register >> 4) & 0xfff, (register >> 20) & 0xfff
+
+        assert all(abs(value - headroom) <= 1 for value in levels()), levels()
+        assert image.call("_IDirectSoundStream_SetVolume@8", stream, -600) == 0
+        assert all(abs(value - (headroom + 384)) <= 1 for value in levels()), levels()
+        assert image.call("_IDirectSoundStream_SetVolume@8", stream, -10000) == 0
+        assert levels() == (0xfff, 0xfff)
+        image.complete(stream)
+        image.service()
+        image.release(stream)
+
+
 def test_pause_gain_pitch_and_adpcm(build):
     image = ApuImage(build)
     stream = image.stream(image.format(rate=22050, adpcm=True))
@@ -207,7 +250,8 @@ def test_pause_gain_pitch_and_adpcm(build):
     assert image.call("_IDirectSoundStream_SetFrequency@8", stream, 44100) == 0
     assert image.call("_IDirectSoundStream_SetVolume@8", stream, -600) == 0
     assert image.voices[hardware]["pitch"] == 2.0
-    assert 0.501 <= image.voices[hardware]["gain"] <= 0.502
+    left, right = image.voices[hardware]["gain"]
+    assert 0.2511 <= left <= 0.2512 and left == right
     assert image.call("_IDirectSoundStream_Pause@8", stream, 0) == 0
     assert image.words(hardware)[0] == 0
     image.complete(stream)
@@ -269,6 +313,31 @@ def test_halo_channel_reuse(build):
             image.complete(stream)
             image.call("_standalone_audio_poll")
     test_game_channel_reuse(build, ApuImage, advance)
+
+
+def test_halo_channel_initialization(build):
+    def playback(image, stream, payload, gain):
+        voice = image.voices[image.hardware(stream)]
+        assert all(abs(g - gain) < 0.001 for g in voice["gain"]), (voice["gain"], gain)
+        assert voice["queues"] == [payload]
+    test_game_channel_initialization(build, ApuImage, playback)
+
+
+def test_halo_spatial_gain(build):
+    def gains(image, stream):
+        image.submit(stream, pcm(10000))
+        voice = image.voices[image.hardware(stream)]
+        image.complete(stream)
+        image.service()
+        return tuple(round(g, 4) for g in voice["gain"])
+    image = None
+
+    class Image(ApuImage):
+        def __init__(self, build):
+            nonlocal image
+            super().__init__(build)
+            image = self
+    test_spatial_gain(build, Image, lambda stream: gains(image, stream))
 
 
 def test_static_buffer(build):
@@ -467,13 +536,135 @@ def test_driver_pio_completion_interleaving(build):
     run("nxAudioBufferSubmit", exhausted_sges, succeeds=False)
 
 
+def test_driver_stream_fifo_and_publication(build):
+    from unicorn import UC_HOOK_MEM_WRITE
+
+    for adpcm in (False, True):
+        image = ApuImage(build)
+        image.hooks.pop(image.symbols["_nxAudioBufferQueue"])
+        voice = image.alloc(bytes(256))
+        image.write(voice + 4, 22050)
+        image.uc.mem_write(voice + 8, b"\x01\x00" if adpcm else b"\x01\x02")
+        image.write(voice + 12, int(adpcm))  # codec
+        image.uc.mem_write(voice + 77, b"\x01")  # streaming
+        image.uc.mem_write(voice + 136, b"\x40")  # voice 64
+        notifiers = image.alloc(bytes(16 * 1026))
+        image.write(image.symbols["_g_hw_notifiers"], notifiers)
+        image.write(image.symbols["_g_tracked_voices"] + 64 * 4, voice)
+        image.write(image.symbols["_g_voice_allocation_mask"],
+                    0xffffffff, 0xffffffff, 0xfffffffe, *([0xffffffff] * 5))
+        image.import_hook("__imp__MmGetPhysicalAddress@4",
+                          lambda: image.return_from_hook(image.args(1)[0], pops=4))
+        image.import_hook("__imp_@InterlockedPopEntrySList@4",
+                          lambda: image.return_from_hook())
+        errors, page_events, publications = [], [], []
+        state = {"locked": False}
+
+        def page_lock():
+            page_events.append(image.args(3))
+            image.return_from_hook(pops=12)
+
+        def set_error():
+            errors.append(image.args(1)[0])
+            image.return_from_hook()
+
+        image.import_hook("__imp__MmLockUnlockBufferPages@12", page_lock)
+        image.hooks[image.symbols["_apu_set_last_error"]] = set_error  # kernel TLS boundary
+
+        def pio_write(uc, access, address, size, value, context):
+            if address == 0xfe8202fc:
+                state["locked"] = bool(value)
+            elif address in (0xfe820320, 0xfe82035c) and value:
+                assert state["locked"], "SSL published after unlocking voice"
+                publications.append(0 if address == 0xfe820320 else 1)
+
+        def notifier_write(uc, access, address, size, value, context):
+            if value == 0:  # IN_PROGRESS
+                assert state["locked"], "empty-slot notifier reset while APU can still process voice"
+
+        image.uc.hook_add(UC_HOOK_MEM_WRITE, pio_write, begin=0xfe8202fc, end=0xfe82035f)
+        image.uc.hook_add(UC_HOOK_MEM_WRITE, notifier_write,
+                          begin=notifiers + (2 + 64 * 4) * 16 + 15,
+                          end=notifiers + (3 + 64 * 4) * 16 + 15)
+
+        def queue(marker, malformed=False):
+            data = (struct.pack("<hBB", marker, 0, 0) + bytes(32)) if adpcm else pcm(marker)
+            if malformed:
+                data = data[:-1]
+            payload = image.alloc(data)
+            buffer = image.alloc(struct.pack("<II", payload, len(data)))
+            result = image.call("_nxAudioBufferQueue", voice, buffer) & 255
+            assert image.irql == 0 and not state["locked"]
+            return result, buffer
+
+        def complete(slot):
+            image.uc.mem_write(notifiers + (2 + 64 * 4 + slot) * 16 + 15, b"\x01")
+            image.call("_apu_dpc@16", 0, 0, 0, 0)
+            assert image.words(voice + 20 + slot * 4)[0] == 0
+
+        # Empty the stream after each packet. The APU waits at the other
+        # slot, so every refill must alternate; first-free always chooses A.
+        for marker in range(8):
+            result, buffer = queue(marker)
+            assert result == 1
+            slot = marker & 1
+            assert publications[-1] == slot, "stream FIFO reordered after starvation"
+            assert image.words(voice + 20 + slot * 4)[0] == buffer
+            complete(slot)
+
+        # A busy next slot must reject queueing even if the other is free.
+        assert queue(8)[0] and queue(9)[0]
+        complete(1)
+        before = len(page_events), len(publications)
+        assert queue(10)[0] == 0
+        assert errors.pop() == 6  # NX_AUDIO_ERR_QUEUE_FULL
+        assert (len(page_events), len(publications)) == before
+        complete(0)
+        assert queue(10)[0] == 1 and publications[-1] == 0
+        complete(0)
+
+        # Failed descriptor construction must unpin and unlock without
+        # advancing FIFO order; the next valid packet still goes to B.
+        before = len(page_events), len(publications)
+        assert queue(11, malformed=True)[0] == 0
+        assert errors.pop() == 5  # NX_AUDIO_ERR_UNSUPPORTED
+        assert len(publications) == before[1]
+        assert len(page_events) == before[0] + 2
+        assert page_events[-2][2] == 0 and page_events[-1][2] == 1
+        assert queue(11)[0] == 1 and publications[-1] == 1
+        complete(1)
+        assert errors == []
+
+
+def test_adapter_waits_for_stream_fifo_slot(build):
+    image = ApuImage(build)
+    stream = image.stream()
+    image.submit(stream, pcm(1), 1)
+    image.submit(stream, pcm(2), 2)
+    # A delayed A completion leaves the next FIFO slot occupied, although
+    # B is already free. Preserve the pending packet rather than abort it.
+    image.complete(stream, (1,))
+    image.submit(stream, pcm(3), 3)
+    hardware = image.hardware(stream)
+    assert image.voices[hardware]["queues"] == [pcm(1), pcm(2)]
+    image.complete(stream, (0,))
+    image.call("_standalone_audio_poll")
+    assert image.voices[hardware]["queues"] == [pcm(1), pcm(2), pcm(3)]
+    image.complete(stream, (0,))
+    image.service()
+    assert image.callbacks == [(42, i, 0) for i in (1, 2, 3)]
+    image.release(stream)
+
+
 if __name__ == "__main__":
     build = Path(sys.argv[1] if len(sys.argv) > 1 else "build-apu")
     for test in (test_four_packets_and_coalesced_completion, test_completion_before_next_process,
-                 test_pause_gain_pitch_and_adpcm, test_stop_timeout_retains_ownership,
+                 test_reference_voice_headroom, test_pause_gain_pitch_and_adpcm, test_stop_timeout_retains_ownership,
                  test_stop_timeout_late_completion,
-                 test_halo_channel_reuse, test_static_buffer, test_driver_descriptor_retirement_and_pinning,
-                 test_driver_pio_completion_interleaving):
+                 test_halo_channel_reuse, test_halo_channel_initialization, test_halo_spatial_gain,
+                 test_static_buffer, test_driver_descriptor_retirement_and_pinning,
+                 test_driver_pio_completion_interleaving,
+                 test_driver_stream_fifo_and_publication, test_adapter_waits_for_stream_fifo_slot):
         test(build)
         print(f"PASS {test.__name__}")
     print("Linked APU adapter checks passed; audible output and timing require device validation.")

@@ -37,9 +37,12 @@ cmake --build build --target standalone_inventory   # -> deps_inventory.json
 
 `HALO_STANDALONE_AUDIO` defaults to `ON`. `compat/dsound_nxdk.c` implements
 the Xbox DirectSound entry-point ABI and stream vtables used by Halo.
-`HALO_STANDALONE_AUDIO_BACKEND` defaults to `software`. The optional `apu`
-backend shares this adapter and uses nxdk-audio hardware voices instead of the
-software output worker. See [audio-apu.md](audio-apu.md) for its build steps,
+`HALO_STANDALONE_AUDIO_BACKEND` defaults to `apu`. This experimental
+backend shares this adapter and uses nxdk-audio hardware voices.
+Select `software` explicitly for the software output worker. Existing CMake
+caches retain their selected backend; pass `-DHALO_STANDALONE_AUDIO_BACKEND=apu`
+to switch them. `./build.sh` selects APU unless the backend environment variable
+requests software. See [audio-apu.md](audio-apu.md) for its build steps,
 local driver patches, validation, and remaining feature gaps.
 `compat/audio_mixer.c` decodes mono/stereo 8/16-bit PCM and Xbox IMA ADPCM
 (format `0x69`, 36 bytes per channel, 64 samples per block), resamples to

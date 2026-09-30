@@ -19,14 +19,16 @@ cmake --build build -j             # -> build/default.xbe
 Or use `./build.sh [seed|apu|standalone|nogpu] [--fresh] [--inventory] [--deploy]`,
 which sets the variables above to local defaults (see `./build.sh --help`).
 
-Audio is enabled by default: PCM and Xbox ADPCM feed a software stereo mixer
-through nxdk's AC97 output. HRTF, spatial attenuation, DSP reverb, and Bink
-movie audio remain unsupported. Audible playback was confirmed on xemu;
+Audio is enabled by default: PCM and Xbox ADPCM use the
+[nxdk-audio APU backend](docs/audio-apu.md) for hardware stereo playback.
+Distance/cone attenuation, occlusion levels, and stereo panning are approximated.
+HRTF filtering, DSP reverb, and Bink movie audio remain unsupported.
+Audible playback was confirmed on xemu;
 real Xbox hardware remains unverified.
 Configure with `-DHALO_STANDALONE_AUDIO=OFF` to use the silent backend.
-An optional [nxdk-audio APU prototype](docs/audio-apu.md) is available through
-`./build.sh apu` or `-DHALO_STANDALONE_AUDIO_BACKEND=apu`. It uses hardware
-voices for stereo playback; spatial audio and DSP feature parity are still pending.
+The APU backend remains experimental; spatial audio and DSP feature parity are pending.
+Use `HALO_STANDALONE_AUDIO_BACKEND=software ./build.sh` or
+`-DHALO_STANDALONE_AUDIO_BACKEND=software` for the software stereo mixer.
 
 See [docs/standalone-build.md](docs/standalone-build.md) for the design, the
 seeded bring-up variant, the boot-test loop and the status.

@@ -22,6 +22,17 @@ if(HALO_STANDALONE_AUDIO)
 		target_sources(standalone_crt PRIVATE nxdk_audio.c)
 	endif()
 endif()
+# USB keyboard for the XAPI debug keyboard. nxdk_usb.lib is built without its
+# HID class driver, so compile it here with nxdk's USB configuration.
+set(USB_DIR "${NXDK_DIR}/lib/usb")
+set(USB_HID_SOURCES
+	"${USB_DIR}/libusbohci/src_hid/hid_core.c"
+	"${USB_DIR}/libusbohci/src_hid/hid_driver.c")
+target_sources(standalone_crt PRIVATE nxdk_keyboard.c ${USB_HID_SOURCES})
+set_property(SOURCE nxdk_keyboard.c ${USB_HID_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
+	"-I${USB_DIR}/libusbohci/inc" "-I${USB_DIR}/libusbohci_xbox"
+	"-DUSBH_USE_EXTERNAL_CONFIG=\"usbh_config_xbox.h\""
+	"-Dsysprintf=standalone_hid_log" "-Dget_ticks=usbh_get_ticks")
 set_target_properties(standalone_crt PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
 target_include_directories(standalone_crt BEFORE PRIVATE
 	"${NXDK_DIR}/lib/pdclib"

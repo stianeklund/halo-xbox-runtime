@@ -185,6 +185,19 @@ char *crt_strtok(char *string, const char *delimiters)
   return token;
 }
 
+/* 0x1d980b: LIBCMT exit(code). doexit (0x1d9761) runs the atexit table and
+ * the C terminators (which flush every stream), then KeBugCheck(0), so it
+ * never returns. Halo calls it only on fatal paths: a re-entered
+ * halt_and_catch_fire (main.c) and libtiff errors. Returning from it, as the
+ * generated stub did, runs past system_exit's __noreturn into unrelated code.
+ * Flush pdclib's streams so d:\debug.txt keeps the exception, then stop. */
+void FUN_001d980b(int code)
+{
+  (void)code;
+  pd_fflush(0);
+  KeBugCheck(0);
+}
+
 /* Seconds since 1970-01-01 UTC, as LIBCMT time() returns them. */
 unsigned int crt_time(int *timer)
 {

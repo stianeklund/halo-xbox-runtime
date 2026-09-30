@@ -1,7 +1,8 @@
 /* Xbox DirectSound ABI adapter over the nxdk AC97 stereo transport.
  * PCM and Xbox IMA ADPCM, software volume/pitch, streams and static buffers.
  * Packet callbacks run only from DirectSoundDoWork on the game thread.
- * HRTF, DSP effects and surround mix bins remain unsupported. */
+ * 3D sources get distance, cone, occlusion and stereo pan gains; HRTF,
+ * Doppler, reverb, DSP effects and surround mix bins remain unsupported. */
 #include "xbox.h"
 #include "audio_mixer.h"
 #include "audio_backend.h"
@@ -11,6 +12,9 @@
 #define DS_NOMEM ((int)0x8007000e)
 #define DS_UNSUPPORTED ((int)0x80004001)
 #define DS_FAILED ((int)0x80004005)
+#define DS_CTRL3D 0x10
+#define DS3DMODE_HEADRELATIVE 1
+#define DS3DMODE_DISABLE 2
 
 void *__cdecl audio_calloc(size_t count, size_t size) __asm__("_calloc");
 void __cdecl audio_free(void *memory) __asm__("_free");
@@ -38,6 +42,13 @@ struct buffer_desc {
   unsigned int mix_bins;
   void *input_mix_bin;
 };
+/* DirectSound 3D state for one stream. Levels are hundredths of a dB. */
+struct spatial {
+  float position[3], cone[3];
+  float min_distance, max_distance;
+  unsigned int inside_angle, outside_angle;
+  int cone_volume, direct, mode;
+};
 struct sound_object;
 struct sound_inner {
   void **vtable;
@@ -57,6 +68,9 @@ struct sound_object {
   struct sound_object *next;
   int is_stream;
   unsigned int max_packets;
+  int volume, bin_volume[2], is_3d;
+  unsigned int mix_bins;
+  struct spatial spatial;
 };
 #pragma pack(pop)
 typedef char stream_inner_offset_check[__builtin_offsetof(struct sound_object, inner) == 0x24 ? 1 : -1];
@@ -213,7 +227,7 @@ static int __stdcall stream_discontinuity(void *stream)
 }
 
 static int create_object(const struct audio_format *format, int is_stream,
-                         struct sound_object **out)
+                         unsigned int flags, struct sound_object **out)
 {
   struct audio_format copy;
   struct sound_object *o;
@@ -232,6 +246,15 @@ static int create_object(const struct audio_format *format, int is_stream,
   o->inner_storage.vtable = inner_vtable;
   o->vtable = stream_vtable;
   o->max_packets = AUDIO_PACKET_COUNT;
+  o->mix_bins = 3;
+  o->is_3d = (flags & DS_CTRL3D) != 0;
+  /* cachebeta's voice-settings constructor (0x2054a8) defaults to
+   * 600 mB headroom for 2D voices and zero for DS_CTRL3D voices. */
+  if (!o->is_3d) o->voice.gain_left = o->voice.gain_right = 16422;
+  o->spatial.min_distance = 1.0f;
+  o->spatial.max_distance = 1e9f;
+  o->spatial.inside_angle = o->spatial.outside_angle = 360;
+  o->spatial.cone[2] = 1.0f;
   standalone_audio_lock();
   if (!audio_output_create(&o->voice, is_stream)) {
     standalone_audio_unlock();
@@ -356,7 +379,7 @@ int __stdcall nxds_stream(void *ds, const struct stream_desc *desc, void **out, 
   if (!out) return DS_INVALID;
   *out = NULL;
   if (!desc || outer || !desc->max_packets || desc->max_packets > AUDIO_PACKET_COUNT) return DS_INVALID;
-  result = create_object(desc->format, 1, &o);
+  result = create_object(desc->format, 1, desc->flags, &o);
   if (result) return result;
   standalone_audio_lock();
   o->callback = desc->callback;
@@ -383,7 +406,7 @@ int __stdcall IDirectSound_CreateSoundBuffer(void *ds, void *desc_ptr, void **ou
   if (!out) return DS_INVALID;
   *out = NULL;
   if (!desc || desc->size != sizeof(*desc) || outer) return DS_INVALID;
-  result = create_object(desc->format, 0, &o);
+  result = create_object(desc->format, 0, desc->flags, &o);
   if (!result) *out = o;
   return result;
 }
@@ -411,17 +434,287 @@ int __stdcall nxds_speakers(void *ds, unsigned int *config)
   return DS_OK;
 }
 
+/* Listener state, already in DirectSound's Y-up axes (Halo swaps Y/Z). */
+static float listener_position[3], listener_front[3] = {0, 0, 1}, listener_top[3] = {0, 1, 0};
+static float listener_rolloff = 1.0f;
+
+/* x87 instructions keep pdclib's math closure out, as unit_power does. */
+static double root(double x)
+{
+  __asm__("fsqrt" : "+t"(x));
+  return x;
+}
+
+static double cosine(double x)
+{
+  __asm__("fcos" : "+t"(x));
+  return x;
+}
+
+static double level_gain(int level)
+{
+  if (level <= -10000) return 0.0;
+  return level >= 0 ? 1.0 : unit_power(0.9988493699365052, (unsigned int)-level);
+}
+
+/* Cone level at the listener, interpolated on the cosine of the angle
+ * between the cone orientation and the source-to-listener direction. */
+static int cone_level(const struct spatial *s, const double *to_listener)
+{
+  double length = root((double)s->cone[0] * s->cone[0] + (double)s->cone[1] * s->cone[1] +
+                       (double)s->cone[2] * s->cone[2]), c, inside, outside;
+  if (s->inside_angle >= 360 && s->outside_angle >= 360) return 0;
+  if (length <= 0.0) return 0;
+  c = (to_listener[0] * s->cone[0] + to_listener[1] * s->cone[1] + to_listener[2] * s->cone[2]) / length;
+  inside = cosine(s->inside_angle * 3.14159265358979 / 360.0);
+  outside = cosine(s->outside_angle * 3.14159265358979 / 360.0);
+  if (c >= inside) return 0;
+  if (c <= outside || inside <= outside) return s->cone_volume;
+  return (int)(s->cone_volume * (inside - c) / (inside - outside));
+}
+
+/* Combine volume, mix-bin levels and the 3D model into the voice's L/R
+ * gains. Distance uses DirectSound's inverse rolloff, clamped at max
+ * distance. The I3DL2 direct path applies occlusion/obstruction at their
+ * low-frequency ratio; their high-frequency filtering is not modelled.
+ * Panning approximates HRTF head shadow: the far ear keeps 30% at 90 deg.
+ * Setters accept out-of-range values as the stubs did; this clamps them.
+ * Caller holds the audio lock. */
+static int apply_gain(struct sound_object *o)
+{
+  const struct spatial *s = &o->spatial;
+  float min_distance = s->min_distance > 0.0f ? s->min_distance : 0.0f;
+  double gain = level_gain(o->volume), left, right;
+  double offset[3], distance, clamped, pan, right_axis[3], axis_length;
+  int i;
+  if (!o->is_3d) gain *= level_gain(-600);
+  left = o->mix_bins & 1 ? level_gain(o->bin_volume[0]) : 0.0;
+  right = o->mix_bins & 2 ? level_gain(o->bin_volume[1]) : 0.0;
+  if (o->is_3d) {
+    gain *= level_gain(s->direct);
+    if (s->mode != DS3DMODE_DISABLE) {
+      for (i = 0; i < 3; i++)
+        offset[i] = s->position[i] - (s->mode == DS3DMODE_HEADRELATIVE ? 0.0f : listener_position[i]);
+      distance = root(offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]);
+      clamped = distance < s->max_distance ? distance : s->max_distance;
+      if (clamped > min_distance && min_distance > 0.0f)
+        gain *= min_distance / (min_distance + listener_rolloff * (clamped - min_distance));
+      if (distance > 0.0) {
+        double to_listener[3];
+        for (i = 0; i < 3; i++) to_listener[i] = -offset[i] / distance;
+        gain *= level_gain(cone_level(s, to_listener));
+        if (s->mode == DS3DMODE_HEADRELATIVE) {
+          right_axis[0] = 1.0; right_axis[1] = right_axis[2] = 0.0;
+        } else {
+          right_axis[0] = (double)listener_top[1] * listener_front[2] - (double)listener_top[2] * listener_front[1];
+          right_axis[1] = (double)listener_top[2] * listener_front[0] - (double)listener_top[0] * listener_front[2];
+          right_axis[2] = (double)listener_top[0] * listener_front[1] - (double)listener_top[1] * listener_front[0];
+        }
+        axis_length = root(right_axis[0] * right_axis[0] + right_axis[1] * right_axis[1] + right_axis[2] * right_axis[2]);
+        if (axis_length > 0.0) {
+          pan = (offset[0] * right_axis[0] + offset[1] * right_axis[1] + offset[2] * right_axis[2]) /
+                (distance * axis_length);
+          if (pan > 0.0) left *= 1.0 - 0.7 * pan;
+          else right *= 1.0 + 0.7 * pan;
+        }
+      }
+    }
+  }
+  o->voice.gain_left = (int)(32768.0 * gain * left);
+  o->voice.gain_right = (int)(32768.0 * gain * right);
+  return audio_output_volume(&o->voice);
+}
+
+/* DS3D_IMMEDIATE is 0. Deferred changes wait for CommitDeferredSettings,
+ * which Halo calls once per frame. */
+static int stream_changed(struct sound_object *o, int apply)
+{
+  int result = apply ? 1 : apply_gain(o);
+  standalone_audio_unlock();
+  return result ? DS_OK : DS_FAILED;
+}
+
+static int apply_all(void)
+{
+  struct sound_object *o;
+  int result = 1;
+  for (o = audio_objects; o; o = o->next)
+    if (o->refs && !apply_gain(o)) result = 0;
+  return result;
+}
+
 int __stdcall IDirectSoundStream_SetVolume(void *stream, int volume)
 {
   struct sound_object *o = stream;
-  int gain;
   if (volume < -10000 || volume > 0) return DS_INVALID;
-  gain = volume == -10000 ? 0 : (int)(32768.0 * unit_power(0.9988493699365052, (unsigned int)-volume));
   standalone_audio_lock();
-  o->voice.gain_left = o->voice.gain_right = gain;
-  gain = audio_output_volume(&o->voice);
+  o->volume = volume;
+  return stream_changed(o, 0);
+}
+
+int __stdcall IDirectSoundStream_SetMixBins(void *stream, unsigned int mix_bins)
+{
+  struct sound_object *o = stream;
+  standalone_audio_lock();
+  o->mix_bins = mix_bins;
+  return stream_changed(o, 0);
+}
+
+/* Early XDK form: one volume per set bit of the mask, lowest bin first.
+ * Only the front-left and front-right bins reach the stereo output. */
+int __stdcall IDirectSoundStream_SetMixBinVolumes_12(void *stream, unsigned int mix_bins,
+                                                    const int *volumes)
+{
+  struct sound_object *o = stream;
+  unsigned int bin, index = 0;
+  if (!volumes) return DS_INVALID;
+  standalone_audio_lock();
+  for (bin = 0; bin < 32; bin++) {
+    if (!(mix_bins & (1u << bin))) continue;
+    if (bin < 2) o->bin_volume[bin] = volumes[index];
+    index++;
+  }
+  return stream_changed(o, 0);
+}
+
+/* The XDK export Halo calls here takes a DSI3DL2BUFFER: direct, direct HF,
+ * room, room HF, room rolloff, obstruction {HF, LF ratio}, occlusion {HF,
+ * LF ratio}. Room/reverb sends have no output path yet. */
+int __stdcall IDirectSoundStream_SetAllParameters(void *stream, void *params,
+                                                 int apply)
+{
+  struct sound_object *o = stream;
+  const int *levels = params;
+  const float *ratios = params;
+  int direct;
+  if (!params) return DS_INVALID;
+  direct = levels[0] + (int)(levels[5] * ratios[6]) + (int)(levels[7] * ratios[8]);
+  standalone_audio_lock();
+  o->spatial.direct = direct < -10000 ? -10000 : direct > 0 ? 0 : direct;
+  return stream_changed(o, apply);
+}
+
+int __stdcall IDirectSoundStream_SetMode(void *stream, int mode, int apply)
+{
+  struct sound_object *o = stream;
+  standalone_audio_lock();
+  o->spatial.mode = mode;
+  return stream_changed(o, apply);
+}
+
+int __stdcall IDirectSoundStream_SetPosition(void *stream, float x, float y, float z,
+                                            int apply)
+{
+  struct sound_object *o = stream;
+  standalone_audio_lock();
+  o->spatial.position[0] = x;
+  o->spatial.position[1] = y;
+  o->spatial.position[2] = z;
+  return stream_changed(o, apply);
+}
+
+/* Doppler is not modelled. */
+int __stdcall IDirectSoundStream_SetVelocity(void *stream, float x, float y, float z,
+                                            int apply)
+{
+  (void)stream;
+  (void)x;
+  (void)y;
+  (void)z;
+  (void)apply;
+  return DS_OK;
+}
+
+int __stdcall IDirectSoundStream_SetConeOrientation(void *stream, float x, float y, float z,
+                                                   int apply)
+{
+  struct sound_object *o = stream;
+  standalone_audio_lock();
+  o->spatial.cone[0] = x;
+  o->spatial.cone[1] = y;
+  o->spatial.cone[2] = z;
+  return stream_changed(o, apply);
+}
+
+int __stdcall IDirectSoundStream_SetMinDistance(void *stream, float distance, int apply)
+{
+  struct sound_object *o = stream;
+  standalone_audio_lock();
+  o->spatial.min_distance = distance;
+  return stream_changed(o, apply);
+}
+
+int __stdcall IDirectSoundStream_SetMaxDistance(void *stream, float distance, int apply)
+{
+  struct sound_object *o = stream;
+  standalone_audio_lock();
+  o->spatial.max_distance = distance;
+  return stream_changed(o, apply);
+}
+
+int __stdcall IDirectSoundStream_SetConeAngles(void *stream, int inside, int outside, int apply)
+{
+  struct sound_object *o = stream;
+  if (outside < 0 || outside > 360) outside = 360;
+  if (inside < 0 || inside > outside) inside = outside;
+  standalone_audio_lock();
+  o->spatial.inside_angle = (unsigned int)inside;
+  o->spatial.outside_angle = (unsigned int)outside;
+  return stream_changed(o, apply);
+}
+
+int __stdcall IDirectSoundStream_SetConeOutsideVolume(void *stream, int volume, int apply)
+{
+  struct sound_object *o = stream;
+  standalone_audio_lock();
+  o->spatial.cone_volume = volume < -10000 ? -10000 : volume > 0 ? 0 : volume;
+  return stream_changed(o, apply);
+}
+
+static int listener_changed(uint32_t apply)
+{
+  int result = apply ? 1 : apply_all();
   standalone_audio_unlock();
-  return gain ? DS_OK : DS_FAILED;
+  return result ? DS_OK : DS_FAILED;
+}
+
+int __stdcall IDirectSound_SetPosition(void *ds, float x, float y, float z, unsigned int apply)
+{
+  (void)ds;
+  standalone_audio_lock();
+  listener_position[0] = x;
+  listener_position[1] = y;
+  listener_position[2] = z;
+  return listener_changed(apply);
+}
+
+int __stdcall IDirectSound_SetOrientation(void *ds, float front_x, float front_y, float front_z,
+                                         float top_x, float top_y, float top_z, unsigned int apply)
+{
+  (void)ds;
+  standalone_audio_lock();
+  listener_front[0] = front_x;
+  listener_front[1] = front_y;
+  listener_front[2] = front_z;
+  listener_top[0] = top_x;
+  listener_top[1] = top_y;
+  listener_top[2] = top_z;
+  return listener_changed(apply);
+}
+
+int __stdcall IDirectSound_SetRolloffFactor(void *ds, float rolloff, unsigned int apply)
+{
+  (void)ds;
+  standalone_audio_lock();
+  listener_rolloff = rolloff >= 0.0f ? rolloff : 0.0f;
+  return listener_changed(apply);
+}
+
+int __stdcall IDirectSound_CommitDeferredSettings(void *ds)
+{
+  (void)ds;
+  standalone_audio_lock();
+  return listener_changed(0);
 }
 
 int __stdcall IDirectSoundStream_SetFrequency(void *stream, int frequency)
@@ -538,48 +831,8 @@ int __stdcall IDirectSoundBuffer_SetLoopRegion(void *buffer, uint32_t start, uin
   return DS_OK;
 }
 
-/* Game-side compatibility for the missing 2276 routines. Offsets, stream
- * flags and packet splitting are read from cachebeta.xbe at 0x1cb210 and
- * 0x1c9670. These live here so HALO_ROOT remains a read-only dependency. */
-boolean dsound_initialize_channel(short type_flags, short channel_index)
-{
-  unsigned char *channel = sound_dsound_channel_get(channel_index);
-  struct audio_format format;
-  struct stream_desc desc;
-  void *stream;
-  *(short *)(channel + 2) = -1;
-  channel[6] = 0;
-  *(short *)(channel + 0x38) = type_flags;
-  *(uint32_t *)(channel + 0x68) = *(uint32_t *)(channel + 0x6c) = 0;
-  csmemset(&format, 0, sizeof(format));
-  if (type_flags & 8) {
-    format.tag = 0x69;
-    format.channels = type_flags & 2 ? 2 : 1;
-    format.rate = sound_dsound_get_sample_rate((type_flags >> 2) & 1);
-    format.bits = 4;
-    format.block_align = 36 * format.channels;
-    format.extra_size = 2;
-    format.samples_per_block = 64;
-    format.bytes_per_second = (format.rate / 64) * format.block_align;
-  } else {
-    format.tag = 1;
-    format.channels = 2;
-    format.rate = *(unsigned int *)0x2bcc1c;
-    format.bits = 16;
-    format.block_align = 4;
-    format.bytes_per_second = format.rate * 4;
-  }
-  csmemset(&desc, 0, sizeof(desc));
-  desc.max_packets = 4;
-  desc.format = &format;
-  desc.callback = (packet_callback)FUN_001ca970;
-  desc.context = (void *)(int)channel_index;
-  desc.flags = type_flags & 1 ? 0x10 : 0;
-  if (nxds_stream(&device, &desc, &stream, NULL)) return false;
-  *(void **)(channel + 0x70) = stream;
-  return true;
-}
-
+/* Game-side packet splitting for the missing 2276 routine at 0x1c9670.
+ * Keep HALO_ROOT a read-only dependency. */
 bool dsound_channel_queue_packet(short channel_index)
 {
   unsigned char *channel = sound_dsound_channel_get(channel_index);
