@@ -9,8 +9,12 @@
 #   --native-xbdm    bridged xemu: keep XBDM traffic native (HALO_NATIVE_XBDM=1)
 #   --watch SECONDS  launch through xbdm_boot_watch.py and stream debug output
 #   --no-launch      upload only
-#   BUILD_ARGS       passed to build.sh (seed|standalone|nogpu, --fresh,
+#   BUILD_ARGS       passed to build.sh (seed|apu|standalone|nogpu, --fresh,
 #                    --inventory); -q/--quiet hides build output unless it fails
+#
+# The build's cachebeta.map is always uploaded next to the XBE: Halo's stack
+# walker reads d:\cachebeta.map, so a map left over from another build names
+# every frame wrongly.
 #
 # Overridable environment: XBOX_HOST, XBOX_TITLE, PYTHON, plus build.sh's.
 set -euo pipefail
@@ -19,7 +23,6 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export HALO_ROOT="${HALO_ROOT:-$(cd "$here/.." && pwd)/halo}"
 PYTHON="${PYTHON:-/usr/bin/python3}"
 xbox_host="${XBOX_HOST:-127.0.0.1}"
-xbox_title="${XBOX_TITLE:-E:\\GAMES\\halo-patched\\standalone_seed.xbe}"
 build_args=()
 quiet=0 launch=1 watch=0 variant=seed
 
@@ -74,15 +77,18 @@ filtered=()
 for arg in ${build_args[@]+"${build_args[@]}"}; do
   case "$arg" in
     -q|--quiet) quiet=1 ;;
-    seed|standalone|nogpu) variant="$arg"; filtered+=("$arg") ;;
+    seed|apu|standalone|nogpu) variant="$arg"; filtered+=("$arg") ;;
     *) filtered+=("$arg") ;;
   esac
 done
+title_name=standalone_seed.xbe
 case "$variant" in
   seed) xbe="$here/build-seed/default.xbe" ;;
+  apu) xbe="$here/build-apu/default.xbe"; title_name=standalone_apu.xbe ;;
   nogpu) xbe="$here/build-nogpu/default.xbe" ;;
   standalone) xbe="$here/build/default.xbe" ;;
 esac
+xbox_title="${XBOX_TITLE:-E:\\GAMES\\halo-patched\\$title_name}"
 
 # Every XBDM call from WSL must re-exec through Windows (or run native when
 # HALO_NATIVE_XBDM=1 for a bridged guest).
@@ -120,9 +126,14 @@ fi
 # The stack walker reads d:\cachebeta.map, i.e. next to the XBE.
 map="$(dirname "$xbe")/cachebeta.map"
 map_title="${xbox_title%\\*}\\cachebeta.map"
-if [[ -f "$map" ]]; then
-  log "uploading ${map} -> ${map_title}"
-  rdcp --timeout 60 --sendfile "$map" "$map_title" || log "map upload failed (stack traces stay unsymbolized)"
+if [[ ! -f "$map" ]]; then
+  log "missing ${map}; the box would keep another build's map"
+  exit 1
+fi
+log "uploading ${map} -> ${map_title}"
+if ! rdcp --timeout 60 --sendfile "$map" "$map_title"; then
+  log "map upload failed; the box may still hold another build's map"
+  exit 1
 fi
 
 if ((!launch)); then
