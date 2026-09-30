@@ -69,6 +69,111 @@ int __stdcall standalone_ReadFileEx(HANDLE handle, void *buffer, unsigned int si
                            &offset));
 }
 
+/* Not XDK behavior: bring-up diagnostic for the cache copy writing zeros past
+ * ~96 MB of a10. Large writes are logged at issue and at completion with the
+ * number of zero sectors and a hash sampled from each sector, so the log
+ * shows whether the buffer was already zero when issued, was changed while
+ * the write was in flight, or completed short. */
+#define WRITE_TRACE_MIN_SIZE 0x100000u
+#define WRITE_TRACE_SLOTS 4
+#define SECTOR_BYTES 512u
+
+typedef void(__stdcall *write_completion_routine)(unsigned long error, unsigned long bytes,
+                                                  void *overlapped);
+
+typedef struct write_trace {
+  void *overlapped;
+  write_completion_routine routine;
+  const unsigned long *buffer;
+  unsigned int size;
+  unsigned long offset;
+  unsigned long hash;
+} write_trace;
+
+static write_trace write_traces[WRITE_TRACE_SLOTS];
+
+static unsigned long sample_buffer(const unsigned long *buffer, unsigned int size,
+                                   unsigned int *zero_sectors)
+{
+  unsigned long hash;
+  unsigned int sector;
+  unsigned int words;
+  const unsigned long *w;
+
+  hash = 0;
+  *zero_sectors = 0;
+  words = SECTOR_BYTES / 4;
+  for (sector = 0; sector < size / SECTOR_BYTES; sector++) {
+    w = buffer + sector * words;
+    if (w[0] == 0 && w[1] == 0 && w[words / 2] == 0 && w[words - 1] == 0) {
+      (*zero_sectors)++;
+    }
+    hash = (hash << 5 | hash >> 27) ^ w[0] ^ w[words / 2];
+  }
+  return hash;
+}
+
+static void __stdcall traced_write_complete(unsigned long error, unsigned long bytes,
+                                            void *overlapped)
+{
+  write_trace *trace;
+  write_completion_routine routine;
+  unsigned long hash;
+  unsigned int zero_sectors;
+  int i;
+
+  trace = NULL;
+  for (i = 0; i < WRITE_TRACE_SLOTS; i++) {
+    if (write_traces[i].overlapped == overlapped) {
+      trace = &write_traces[i];
+      break;
+    }
+  }
+  if (trace == NULL) {
+    DbgPrint("[wfx] done: unknown overlapped=%p err=%lu bytes=%lx\n", overlapped, error, bytes);
+    return;
+  }
+  hash = sample_buffer(trace->buffer, trace->size, &zero_sectors);
+  DbgPrint("[wfx] done off=%08lx size=%x bytes=%lx err=%lu zero=%u hash=%08lx%s%s\n",
+           trace->offset, trace->size, bytes, error, zero_sectors, hash,
+           hash != trace->hash ? " CHANGED" : "", bytes != trace->size ? " SHORT" : "");
+  routine = trace->routine;
+  trace->overlapped = NULL;
+  routine(error, bytes, overlapped);
+}
+
+static void *trace_write_issue(const void *buffer, unsigned int size, void *overlapped,
+                               void *completion_routine, LARGE_INTEGER offset)
+{
+  write_trace *trace;
+  unsigned int zero_sectors;
+  int i;
+
+  if (size < WRITE_TRACE_MIN_SIZE) {
+    return completion_routine;
+  }
+  trace = NULL;
+  for (i = 0; i < WRITE_TRACE_SLOTS; i++) {
+    if (write_traces[i].overlapped == NULL) {
+      trace = &write_traces[i];
+      break;
+    }
+  }
+  if (trace == NULL) {
+    DbgPrint("[wfx] no free trace slot off=%08lx\n", offset.LowPart);
+    return completion_routine;
+  }
+  trace->overlapped = overlapped;
+  trace->routine = (write_completion_routine)completion_routine;
+  trace->buffer = (const unsigned long *)buffer;
+  trace->size = size;
+  trace->offset = offset.LowPart;
+  trace->hash = sample_buffer(trace->buffer, size, &zero_sectors);
+  DbgPrint("[wfx] issue off=%08lx size=%x buf=%p zero=%u hash=%08lx first=%08lx\n",
+           trace->offset, size, buffer, zero_sectors, trace->hash, trace->buffer[0]);
+  return (void *)traced_write_complete;
+}
+
 /* 0x1d1a38 */
 int __stdcall standalone_WriteFileEx(HANDLE handle, const void *buffer, unsigned int size,
                                      void *overlapped, void *completion_routine)
@@ -76,6 +181,7 @@ int __stdcall standalone_WriteFileEx(HANDLE handle, const void *buffer, unsigned
   LARGE_INTEGER offset;
 
   offset = overlapped_offset(overlapped);
+  completion_routine = trace_write_issue(buffer, size, overlapped, completion_routine, offset);
   return finish(NtWriteFile(handle, 0, kernel_NtUserIoApcDispatcher,
                             completion_routine, (PIO_STATUS_BLOCK)overlapped, (void *)buffer,
                             size, &offset));
