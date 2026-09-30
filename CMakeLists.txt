@@ -104,6 +104,7 @@ set(STANDALONE_COMPAT_SOURCES
 	compat/xapi_launch.c
 	compat/xapi_memory.c
 	compat/xapi_savegame.c
+	compat/xapi_nickname.c
 	compat/xapi_signature.c
 	compat/xapi_thread.c
 	compat/xapi_xvutil.c
