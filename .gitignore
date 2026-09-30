@@ -2,3 +2,7 @@ build*/
 artifacts/
 __pycache__/
 *.pyc
+.tmp*/
+.serena/
+.idea/
+.codegraph
