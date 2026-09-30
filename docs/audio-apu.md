@@ -80,6 +80,19 @@ Halo/nxdk CRT `fabs` symbol into the link. Source license headers are preserved:
 upstream code is MIT, and the HRTF table carries CC BY 4.0 attribution in
 `audio_hrtf.h` (HRTF is not enabled in this milestone).
 
+The local patch also protects voice-register PIO transactions at DPC level.
+The completion DPC selects a voice to retire its SSL descriptor, so it must not
+interrupt another transaction between `SET_CURRENT_VOICE` and its final write.
+Otherwise gain, pitch, format, or buffer settings can reach a different sound.
+This includes voice initialization, setters, and static-buffer submission;
+floating-point gain/pitch calculations remain outside the protected section.
+The linked regression injects the actual completion DPC during thirteen driver
+operations, checks that their writes retain the intended voice, and verifies
+that deferred completion runs after IRQL is restored, including failed static
+submission. It reproduces a redirected gain write against the previous build.
+This establishes the race and its correction; sustained environmental sounds
+still need an audible xemu retest to confirm the reported distortion is resolved.
+
 The standalone shim generator also recognizes absolute archive/object symbols.
 Without this, its fallback replaces nxdk's `__tls_array = 4` with a function
 stub and crashes the first CRT thread before the game starts. APU linked tests

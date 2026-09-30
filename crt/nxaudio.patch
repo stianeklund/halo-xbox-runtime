@@ -59,9 +59,187 @@
      }
  
      const uint32_t notifier_idx =
+@@ -311,6 +317,7 @@
+         }
+     }
+ 
++    const KIRQL irql = KeRaiseIrqlToDpcLevel();
+     apu_wait_for_pio(4);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
+@@ -320,8 +327,10 @@
+     MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, FALSE);
+     if (!insert_buffer_to_sge(voice, buffer)) {
+         MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, TRUE);
+-        return false;
+-    }
++        KfLowerIrql(irql);
++        return false;
++    }
++    KfLowerIrql(irql);
+     return true;
+ }
+ 
 --- a/audio_voice.c
 +++ b/audio_voice.c
-@@ -753,7 +753,8 @@
+@@ -95,6 +95,9 @@
+ 
+ void apu_flush_voice (nxAudioVoice *voice)
+ {
++    /* SET_CURRENT_VOICE is shared with the completion DPC. Keep each
++     * PIO transaction at DPC level; calculate floating-point values first. */
++    const KIRQL irql = KeRaiseIrqlToDpcLevel();
+     apu_wait_for_pio(18);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
+     apu_write_reg(APU_VP_OFFSET + 0x350, 0);
+@@ -114,6 +117,7 @@
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLC, voice->tar_volc);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_PITCH, voice->tar_pitch_link);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_HRTF, voice->hrtf_target);
++    KfLowerIrql(irql);
+ }
+ 
+ bool nxAudioVoiceCreate (nxAudioVoice *voice, const nxAudioFormat *format)
+@@ -427,6 +431,7 @@
+     voice->master_gain = gain;
+     voice_update_volumes(voice);
+ 
++    const KIRQL irql = KeRaiseIrqlToDpcLevel();
+     apu_wait_for_pio(6);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
+@@ -434,6 +439,7 @@
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLB, voice->tar_volb);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLC, voice->tar_volc);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
++    KfLowerIrql(irql);
+     return true;
+ }
+ 
+@@ -460,6 +466,7 @@
+ 
+     voice_update_volumes(voice);
+ 
++    const KIRQL irql = KeRaiseIrqlToDpcLevel();
+     apu_wait_for_pio(6);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
+@@ -467,6 +474,7 @@
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLB, voice->tar_volb);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLC, voice->tar_volc);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
++    KfLowerIrql(irql);
+ 
+     return true;
+ }
+@@ -487,6 +495,7 @@
+ 
+     voice_update_volumes(voice);
+ 
++    const KIRQL irql = KeRaiseIrqlToDpcLevel();
+     apu_wait_for_pio(6);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
+@@ -494,6 +503,7 @@
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLB, voice->tar_volb);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLC, voice->tar_volc);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
++    KfLowerIrql(irql);
+ 
+     return true;
+ }
+@@ -518,11 +528,13 @@
+         voice->cfg_fmt |= APU_MAKE_VALUE(NV_PAVS_VOICE_CFG_FMT_LOOP, 1);
+     }
+ 
++    const KIRQL irql = KeRaiseIrqlToDpcLevel();
+     apu_wait_for_pio(4);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_FMT, voice->cfg_fmt);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
++    KfLowerIrql(irql);
+     return true;
+ }
+ 
+@@ -583,12 +595,14 @@
+     voice->tar_pitch_link &= ~((uint32_t)NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH);
+     voice->tar_pitch_link |= APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH, (uint32_t)(int16_t)pitch_val);
+ 
++    const KIRQL irql = KeRaiseIrqlToDpcLevel();
+     apu_wait_for_pio(5);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_FMT, voice->cfg_fmt);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_PITCH, voice->tar_pitch_link);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
++    KfLowerIrql(irql);
+ 
+     return true;
+ }
+@@ -605,11 +619,13 @@
+     const uint32_t tar_pitch = APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH, (uint32_t)(int16_t)pitch_val);
+     voice->pitch = pitch;
+ 
++    const KIRQL irql = KeRaiseIrqlToDpcLevel();
+     apu_wait_for_pio(4);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_PITCH, tar_pitch);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
++    KfLowerIrql(irql);
+     return true;
+ }
+ 
+@@ -652,6 +668,7 @@
+ 
+     voice->amplitude_adsr_enabled = true;
+ 
++    const KIRQL irql = KeRaiseIrqlToDpcLevel();
+     apu_wait_for_pio(6);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
+@@ -659,6 +676,7 @@
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_ENVA, voice->cfg_enva);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_LFO_ENV, voice->tar_lfo_env);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
++    KfLowerIrql(irql);
+     return true;
+ }
+ 
+@@ -701,6 +719,7 @@
+ 
+     voice->filter_adsr_enabled = true;
+ 
++    const KIRQL irql = KeRaiseIrqlToDpcLevel();
+     apu_wait_for_pio(6);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
+@@ -708,6 +727,7 @@
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_ENVF, voice->cfg_envf);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_MISC, voice->cfg_misc);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
++    KfLowerIrql(irql);
+     return true;
+ }
+ 
+@@ -736,6 +756,7 @@
+     voice->cfg_misc &= ~((uint32_t)(NV_PAVS_VOICE_CFG_MISC_FMODE | (0x7 << 18)));
+     voice->cfg_misc |= APU_MAKE_VALUE(NV_PAVS_VOICE_CFG_MISC_FMODE, mode) | APU_MAKE_VALUE((0x7 << 18), q_coefficient);
+ 
++    const KIRQL irql = KeRaiseIrqlToDpcLevel();
+     apu_wait_for_pio(6);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
+@@ -743,6 +764,7 @@
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_FCB, tar_fcb);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_MISC, voice->cfg_misc);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
++    KfLowerIrql(irql);
+ 
+     return true;
+ }
+@@ -753,7 +775,8 @@
          return 0;
      }
  
@@ -71,3 +249,36 @@
  }
  
  bool nxAudioVoiceSetPlaybackOffset (nxAudioVoice *voice, uint32_t byte_offset)
+@@ -783,11 +806,13 @@
+         return false;
+     }
+ 
++    const KIRQL irql = KeRaiseIrqlToDpcLevel();
+     apu_wait_for_pio(4);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_BUF_CBO, block_offset);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
++    KfLowerIrql(irql);
+ 
+     return true;
+ }
+@@ -856,6 +881,7 @@
+         voice_update_volumes(voice);
+     }
+ 
++    const KIRQL irql = KeRaiseIrqlToDpcLevel();
+     apu_wait_for_pio(3);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
+@@ -870,6 +896,7 @@
+     }
+     apu_wait_for_pio(1);
+     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
+-
+-    return true;
+-}
++    KfLowerIrql(irql);
++
++    return true;
++}

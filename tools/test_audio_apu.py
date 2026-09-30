@@ -346,12 +346,134 @@ def test_driver_descriptor_retirement_and_pinning(build):
     assert descriptors == [1, 0] and image.words(voice + 24)[0] == 0
 
 
+def test_driver_pio_completion_interleaving(build):
+    from unicorn import UC_HOOK_CODE, UC_HOOK_MEM_WRITE
+    from unicorn.x86_const import UC_X86_REG_EIP, UC_X86_REG_ESP
+
+    # Run real driver functions, not the adapter's gain/pitch mocks. Inject
+    # the real completion DPC after selecting voice 64. It selects voice 65
+    # to retire a buffer; the interrupted transaction must still target 64.
+    def run(method, arguments, succeeds=True):
+        image = ApuImage(build)
+        image.hooks.pop(image.symbols["_" + method], None)
+        target, completed = [image.alloc(bytes(256)) for _ in range(2)]
+        for voice, index in ((target, 64), (completed, 65)):
+            # Pinned driver's x86 nxAudioVoice ABI, as in the DPC test above.
+            image.write(voice, 3)  # NX_STOPPED
+            image.write(voice + 4, 48000)
+            image.uc.mem_write(voice + 8, b"\x01\x02")  # mono PCM16
+            image.write(voice + 36, 0x3f800000)  # master_gain = 1
+            image.write(voice + 72, 0x3f800000)  # pitch = 1
+            image.uc.mem_write(voice + 136, bytes([index]))
+            image.write(voice + 168, 0xffff)  # HRTF_NULL_HANDLE
+        image.write(image.symbols["_g_hw_voices"], image.alloc(bytes(128 * 256)))
+        payload = image.alloc(pcm(100))
+        buffer = image.alloc(struct.pack("<II", payload, 2))
+        image.write(completed + 20, buffer, 0)
+        image.uc.mem_write(completed + 77, b"\x01")  # streaming
+        notifiers = image.alloc(bytes(16 * 1026))
+        image.uc.mem_write(notifiers + (2 + 65 * 4) * 16 + 15, b"\x01")
+        image.write(image.symbols["_g_hw_notifiers"], notifiers)
+        image.write(image.symbols["_g_tracked_voices"] + 65 * 4, completed)
+        image.write(image.symbols["_g_voice_allocation_mask"],
+                    0xffffffff, 0xffffffff, 0xfffffffd, *([0xffffffff] * 5))
+        image.import_hook("__imp__MmLockUnlockBufferPages@12",
+                          lambda: image.return_from_hook(pops=12))
+        image.import_hook("__imp__MmGetPhysicalAddress@4",
+                          lambda: image.return_from_hook(image.args(1)[0], pops=4))
+        image.import_hook("__imp_@InterlockedPopEntrySList@4",
+                          lambda: image.return_from_hook())
+        errors = []
+
+        def set_error():
+            # Last-error storage uses kernel TLS, which this harness omits.
+            errors.append(image.args(1)[0])
+            image.return_from_hook()
+
+        image.hooks[image.symbols["_apu_set_last_error"]] = set_error
+        state = {"selected": None, "pending": False, "delivered": False,
+                 "context": None, "writes": 0}
+
+        def pio_write(uc, access, address, size, value, context):
+            if address == 0xfe8202f8:  # SET_CURRENT_VOICE
+                state["selected"] = value
+                if value == 64 and not state["delivered"]:
+                    state["pending"] = True
+            elif state["context"] is None:
+                assert state["selected"] == 64, f"{method}: write redirected to another voice"
+                state["writes"] += 1
+
+        def schedule_dpc(uc, address, size, context):
+            if address == 0x30000020 and state["context"] is not None:
+                uc.context_restore(state["context"])
+                uc.reg_write(UC_X86_REG_EIP, state["resume"])
+                image.irql = state["previous_irql"]
+                state["context"] = None
+            elif state["pending"] and image.irql < 2:
+                state["pending"] = False
+                state["delivered"] = True
+                state["context"] = uc.context_save()
+                state["resume"] = uc.reg_read(UC_X86_REG_EIP)
+                state["previous_irql"] = image.irql
+                image.irql = 2
+                uc.mem_write(0x200fe000, struct.pack("<5I", 0x30000020, 0, 0, 0, 0))
+                uc.reg_write(UC_X86_REG_ESP, 0x200fe000)
+                uc.reg_write(UC_X86_REG_EIP, image.symbols["_apu_dpc@16"])
+            elif image.irql >= 2:
+                # Gain/pitch calculations must precede the protected writes.
+                opcode = uc.mem_read(address, 1)[0]
+                assert not 0xd8 <= opcode <= 0xdf, f"{method}: x87 work at DPC level"
+
+        image.uc.hook_add(UC_HOOK_MEM_WRITE, pio_write, begin=0xfe8202f8, end=0xfe82037f)
+        image.uc.hook_add(UC_HOOK_CODE, schedule_dpc)
+        try:
+            result = image.call("_" + method, target, *arguments(image, buffer))
+        except Exception as error:
+            raise AssertionError(f"driver interleaving case: {method}") from error
+        if method != "apu_flush_voice":
+            assert bool(result & 255) == succeeds
+        assert state["writes"] > 0 and state["delivered"], f"{method}: DPC was not exercised"
+        assert errors == ([] if succeeds else [1])  # NX_AUDIO_ERR_OUT_OF_MEMORY
+        assert image.irql == 0 and state["context"] is None
+        assert image.words(completed + 20)[0] == 0, "deferred completion did not retire buffer"
+
+    def floats(*values):
+        return struct.unpack("<" + "I" * len(values), struct.pack("<" + "f" * len(values), *values))
+
+    cases = {
+        "nxAudioVoiceSetChannelGain": lambda image, buffer: floats(.2, .3, 0, 0, 0, 0),
+        "nxAudioVoiceSetMasterGain": lambda image, buffer: floats(.4),
+        "nxAudioVoiceSetHRTFGain": lambda image, buffer: floats(.4, .5),
+        "nxAudioVoiceSetPitch": lambda image, buffer: floats(.8),
+        "nxAudioVoiceSetLooping": lambda image, buffer: (1,),
+        "nxAudioVoiceSetFormat": lambda image, buffer: (
+            image.alloc(struct.pack("<IBB2xII", 48000, 1, 2, 0, 0)),),
+        "nxAudioVoiceSetHRTFTarget": lambda image, buffer: (0,),
+        "nxAudioVoiceSetPlaybackOffset": lambda image, buffer: (0,),
+        "nxAudioVoiceSetAmplitudeEnvelope": lambda image, buffer: (image.alloc(bytes(24)),),
+        "nxAudioVoiceSetFilterEnvelope": lambda image, buffer: (image.alloc(bytes(24)),),
+        "nxAudioVoiceSetFilterCoefficients": lambda image, buffer: (0, 0, 0, 0, 0, 0),
+        "apu_flush_voice": lambda image, buffer: (),
+        "nxAudioBufferSubmit": lambda image, buffer: (buffer,),
+    }
+    for method, arguments in cases.items():
+        run(method, arguments)
+
+    def exhausted_sges(image, buffer):
+        image.write(image.symbols["_g_sge_bitmap"], *([0xffffffff] * 64))
+        return (buffer,)
+
+    # Failed static submission must also lower IRQL and service completion.
+    run("nxAudioBufferSubmit", exhausted_sges, succeeds=False)
+
+
 if __name__ == "__main__":
     build = Path(sys.argv[1] if len(sys.argv) > 1 else "build-apu")
     for test in (test_four_packets_and_coalesced_completion, test_completion_before_next_process,
                  test_pause_gain_pitch_and_adpcm, test_stop_timeout_retains_ownership,
                  test_stop_timeout_late_completion,
-                 test_halo_channel_reuse, test_static_buffer, test_driver_descriptor_retirement_and_pinning):
+                 test_halo_channel_reuse, test_static_buffer, test_driver_descriptor_retirement_and_pinning,
+                 test_driver_pio_completion_interleaving):
         test(build)
         print(f"PASS {test.__name__}")
     print("Linked APU adapter checks passed; audible output and timing require device validation.")
