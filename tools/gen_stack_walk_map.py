@@ -23,8 +23,10 @@ which is wrong for a relinked image. Without the match the bias stays 0 and
 addresses are looked up as-is.
 """
 import argparse
+import errno
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import deps_inventory as inv  # noqa: E402
@@ -42,6 +44,23 @@ def clean(token, fallback):
     return token[:MAX_NAME]
 
 
+def read_map_lines(path):
+    # WSL's Windows-mounted filesystem can return ENODATA just after linking.
+    # Read the whole map before parsing so a failed read cannot leave partial
+    # symbols behind; each retry reopens the file from the beginning.
+    for attempt in range(3):
+        try:
+            with open(path) as f:
+                return f.readlines()
+        except OSError as exc:
+            if exc.errno != errno.ENODATA or attempt == 2:
+                raise
+            delay = 0.1 * (2 ** attempt)
+            print('retrying linker map read after ENODATA: %s' % path,
+                  file=sys.stderr)
+            time.sleep(delay)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('map', help='lld-link map of the standalone build')
@@ -56,18 +75,17 @@ def main():
             syms[e['addr']] = (clean(e['name'], 'FUN_%08x' % e['addr']),
                                clean(e['object'], 'legacy'))
 
-    with open(args.map) as f:
-        for line in f:
-            if not line.startswith(' 0001:'):
-                continue
-            m = MAP_RE.match(line)
-            if not m:
-                continue
-            va = int(m.group(2), 16)
-            if va < LEGACY_END:
-                continue
-            syms[va] = (clean(m.group(1), 'sym_%08x' % va),
-                        clean(m.group(3), 'standalone'))
+    for line in read_map_lines(args.map):
+        if not line.startswith(' 0001:'):
+            continue
+        m = MAP_RE.match(line)
+        if not m:
+            continue
+        va = int(m.group(2), 16)
+        if va < LEGACY_END:
+            continue
+        syms[va] = (clean(m.group(1), 'sym_%08x' % va),
+                    clean(m.group(3), 'standalone'))
 
     with open(args.out, 'w', newline='\r\n') as f:
         f.write(' halo standalone\n\n')
