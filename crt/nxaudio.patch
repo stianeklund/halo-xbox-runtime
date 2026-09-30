@@ -1,0 +1,73 @@
+--- a/audio_core.c
++++ b/audio_core.c
+@@ -41,7 +41,7 @@
+ #ifndef __INTELLISENSE__
+ #ifndef __clang_analyzer__
+ static const char passthrough_text[] = {
+-#embed "passthrough.out"
++#include "passthrough.inc"
+     , '\0'};
+ #endif
+ #endif
+@@ -293,8 +293,15 @@
+                     if (!buffer) {
+                         continue;
+                     }
+-                    MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, TRUE);
++                    /* Static buffers stay pinned until replaced/destroyed. */
+                     if (voice->streaming) {
++                        /* Retire the hardware SSL before releasing ownership.
++                         * PERSIST otherwise revisits stale descriptors when
++                         * the other slot drains before the worker refills. */
++                        apu_wait_for_pio(2);
++                        apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
++                        apu_write_reg(APU_VP_OFFSET + (j == 0 ? NV1BA0_PIO_SET_VOICE_SSL_A : NV1BA0_PIO_SET_VOICE_SSL_B), 0);
++                        MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, TRUE);
+                         voice->buffers_hardware[j] = NULL;
+                         if (voice->callback) {
+                             voice->callback(voice, voice->user_context);
+@@ -693,7 +700,7 @@
+     }
+ 
+     // Snap azimuth to nearest 5-degree grid point
+-    float abs_azimuth = fabsf(azimuth);
++    float abs_azimuth = azimuth < 0.0f ? -azimuth : azimuth;
+     int n_azimuth = (int)(abs_azimuth + 2.5f) / 5 * 5;
+ 
+     // At elevation 90 (directly above), azimuth is meaningless
+--- a/audio_buffer.c
++++ b/audio_buffer.c
+@@ -74,7 +74,7 @@
+         (voice->voice_index * MCPX_HW_MAX_PRD_ENTRIES_PER_VOICE) + (buffer_index * MCPX_HW_MAX_PRD_ENTRIES_PER_SSL);
+ 
+     const uint32_t bytes_per_block = apu_format_blocks_to_bytes(&voice->format, 1);
+-    const uint32_t max_bytes_per_ssl = apu_format_blocks_to_bytes(&voice->format, 65535);
++    const uint32_t max_bytes_per_ssl = apu_format_blocks_to_bytes(&voice->format, voice->format.codec == NX_AUDIO_CODEC_ADPCM ? 65535 / 64 : 65535);
+ 
+     // Pre-compute all SSL entries before touching hardware
+     mcpx_ssl_t hw_ssls[MCPX_HW_MAX_PRD_ENTRIES_PER_SSL];
+@@ -134,6 +134,12 @@
+         ssl_indices_in_segment[index] = absolute_ssl_index % 64;
+ 
+         index++;
++    }
++
++    /* Do not silently accept a truncated buffer at a fragmented page edge. */
++    if (bytes_left) {
++        apu_set_last_error(NX_AUDIO_ERR_UNSUPPORTED);
++        return false;
+     }
+ 
+     const uint32_t notifier_idx =
+--- a/audio_voice.c
++++ b/audio_voice.c
+@@ -753,7 +753,8 @@
+         return 0;
+     }
+ 
+-    return g_hw_voices[voice->voice_index].par_offset & NV_PAVS_VOICE_PAR_OFFSET_CBO;
++    const uint32_t blocks = g_hw_voices[voice->voice_index].par_offset & NV_PAVS_VOICE_PAR_OFFSET_CBO;
++    return apu_format_blocks_to_bytes(&voice->format, blocks);
+ }
+ 
+ bool nxAudioVoiceSetPlaybackOffset (nxAudioVoice *voice, uint32_t byte_offset)

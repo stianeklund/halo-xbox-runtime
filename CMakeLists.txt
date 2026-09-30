@@ -41,6 +41,15 @@ endif()
 # (but not yet runnable) image.
 set(HALO_STANDALONE_SEED_XBE "" CACHE FILEPATH "DEV ONLY: seed legacy data from this cachebeta.xbe")
 option(HALO_STANDALONE_GPU_STATE "Push D3D render/texture-state methods to the GPU (OFF: mirror and device-field updates only)" ON)
+option(HALO_STANDALONE_AUDIO "Mix PCM/Xbox ADPCM through nxdk's stereo AC97 output" ON)
+set(HALO_STANDALONE_AUDIO_BACKEND "software" CACHE STRING "Audio backend: software or apu (experimental nxdk-audio)")
+set_property(CACHE HALO_STANDALONE_AUDIO_BACKEND PROPERTY STRINGS software apu)
+if(NOT HALO_STANDALONE_AUDIO_BACKEND MATCHES "^(software|apu)$")
+	message(FATAL_ERROR "HALO_STANDALONE_AUDIO_BACKEND must be software or apu")
+endif()
+set(NXDK_AUDIO_DIR "${CMAKE_CURRENT_LIST_DIR}/../nxdk-audio" CACHE PATH "nxdk-audio checkout (pinned revision; see docs/audio-apu.md)")
+set(NXDK_AUDIO_REVISION "fc2deca2cc1e434805ac03ca7c2f500b3b028f36")
+set(NXDK_AUDIO_ASSEMBLER "${CMAKE_CURRENT_LIST_DIR}/build-audio-tools/bin/dsp56300-asm" CACHE FILEPATH "dsp56300-asm 1.0.0 executable")
 option(HALO_STANDALONE_TRACE_TEXTURE_STAGES "Debug: log shader-stage program and per-stage texture format/control0 before each D3D draw (DbgPrint + COM1)" OFF)
 # Section layout / classification only; never linked into the output.
 set(HALO_STANDALONE_LAYOUT_XBE "${HALO_ROOT}/halo-patched/cachebeta.xbe" CACHE FILEPATH
@@ -92,7 +101,6 @@ set(STANDALONE_COMPAT_SOURCES
 	compat/d3d8_device.c
 	compat/d3d8_state.c
 	compat/d3d8_draw.c
-	compat/dsound_silent.c
 	compat/xapi_fileio.c
 	compat/xapi_heap.c
 	compat/xapi_input.c
@@ -108,10 +116,18 @@ set(STANDALONE_COMPAT_SOURCES
 	compat/xapi_thread.c
 	compat/xapi_xvutil.c
 )
+if(HALO_STANDALONE_AUDIO)
+	list(APPEND STANDALONE_COMPAT_SOURCES compat/dsound_nxdk.c)
+else()
+	list(APPEND STANDALONE_COMPAT_SOURCES compat/dsound_silent.c)
+endif()
 list(TRANSFORM STANDALONE_COMPAT_SOURCES PREPEND "${CMAKE_CURRENT_LIST_DIR}/")
 add_library(halo OBJECT "${gen_dir}/build_info.c" "${CMAKE_CURRENT_LIST_DIR}/standalone_runtime.c"
 	${STANDALONE_COMPAT_SOURCES})
 add_dependencies(halo standalone_decl)
+if(HALO_STANDALONE_AUDIO AND HALO_STANDALONE_AUDIO_BACKEND STREQUAL "apu")
+	target_compile_definitions(halo PRIVATE HALO_AUDIO_APU=1)
+endif()
 add_subdirectory("${HALO_ROOT}/src" src)
 add_subdirectory(crt)
 

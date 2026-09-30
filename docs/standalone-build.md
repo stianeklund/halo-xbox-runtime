@@ -11,8 +11,11 @@ decompilation target. This repository builds against a halo checkout
 codegen. The only source-level
 hook is `HALO_STANDALONE`, which the reference build does not define.
 
-**Status: parked (2026-09-27).** The target still configures and builds, and it
-must keep doing so. Active work has moved to the reference build: compiling the
+**Status: experimental.** A stereo nxdk audio backend was added on 2026-09-30;
+linked-code tests pass and audible playback was confirmed on xemu after fixing
+the transport's dependency on S/PDIF completion. Real Xbox hardware remains
+unverified.
+The previous bring-up work (2026-09-27) moved to the reference build: compiling the
 patch against nxdk headers instead of `third_party/xbox`. The reference build
 already needs no XDK at compile time: clang, in-repo headers, and import libs
 made by `lld-link /lib` from `.def` files. Only `ENABLE_XDK_HYBRID` (off by
@@ -29,6 +32,81 @@ cmake --build build -j
 # -> build/default.xbe, halo.map, generated/link_report.json
 cmake --build build --target standalone_inventory   # -> deps_inventory.json
 ```
+
+## Audio
+
+`HALO_STANDALONE_AUDIO` defaults to `ON`. `compat/dsound_nxdk.c` implements
+the Xbox DirectSound entry-point ABI and stream vtables used by Halo.
+`HALO_STANDALONE_AUDIO_BACKEND` defaults to `software`. The optional `apu`
+backend shares this adapter and uses nxdk-audio hardware voices instead of the
+software output worker. See [audio-apu.md](audio-apu.md) for its build steps,
+local driver patches, validation, and remaining feature gaps.
+`compat/audio_mixer.c` decodes mono/stereo 8/16-bit PCM and Xbox IMA ADPCM
+(format `0x69`, 36 bytes per channel, 64 samples per block), resamples to
+48 kHz, applies volume/pitch, mixes voices, and clips to signed 16-bit stereo.
+Static buffers support playback, stop, seek, and looping.
+
+`crt/nxdk_audio.c` uses nxdk's XAudio HAL, which is already linked through
+`libnxdk_hal`; SDL is not required. Three contiguous 1024-frame buffers feed
+AC97. The interrupt's DPC signals a semaphore; the worker uses a bounded wait
+and tracks analog DMA's current descriptor with supported 32-bit MMIO reads.
+This avoids waiting indefinitely for S/PDIF completion, which xemu currently
+does not supply, and counts multiple completions when DPC signals coalesce.
+The worker does the mixing independently of game frames. Game callbacks execute
+only from `DirectSoundDoWork`, outside the mixer lock. A stream retains each
+packet until that callback is dispatched. Flush and final release invoke
+`DirectSoundDoWork` before returning to drain aborted packets: Halo can reuse
+an idle channel immediately, and delayed aborts would decrement the new sound's
+pending count. Completions indicate that data was mixed into the output queue;
+they do not indicate the precise time samples reached the speakers.
+
+The backend also supplies the missing game-side `dsound_channel_queue_packet`
+and creates channel streams with the proper format and completion callback.
+Channel offsets and packet splitting were checked against build 2276 at
+`0x1c9670` and `0x1cb210`. The reference Halo checkout is not modified.
+
+This is a stereo playback implementation. Spatial positioning/attenuation,
+HRTF, Doppler, DSP reverb, surround mix bins, and Bink movie sound remain
+unsupported; their existing entry-point stubs are visible in `link_report.json`.
+Audible playback was confirmed on xemu on 2026-09-30. A channel-reuse completion
+defect caused rapid plasma-pistol fire to drop effects; the user confirmed that
+the fix resolves that gameplay issue. Subtle level/mixing differences remain
+reported. A brief live mixer sample showed no clipping, but does not establish
+level accuracy or exclude clipping during louder gameplay. Real Xbox
+playback and real-time performance with many voices still need testing.
+Existing game bring-up blockers can prevent sounds from being
+submitted even when the audio backend is working.
+
+To select the silent backend:
+
+```bash
+cmake -S . -B build-seed -DHALO_STANDALONE_AUDIO=OFF
+cmake --build build-seed -j
+```
+
+To run the linked 32-bit checks with Python `pefile` and `unicorn` installed:
+
+```bash
+cmake -S . -B build-seed -DHALO_STANDALONE_AUDIO=ON
+cmake --build build-seed -j
+python3 tools/test_audio.py build-seed
+python3 tools/audio_status.py build-seed/halo.map --host 127.0.0.1
+```
+
+The tests simulate allocation, locking, and nxdk output while executing the
+compiled adapter and mixer. They check decoding, stereo mixing/clipping,
+resampling, volume/pitch, packet capacity, callbacks/events, pause/flush,
+reference counting, buffer loops, the game's channel queue path, repeated
+channel stop/reuse with the actual game callbacks and cache references, and stack
+cleanup for the actual `__stdcall`/`thiscall` methods. Transport checks execute
+the linked worker with simulated analog progress and no S/PDIF callbacks,
+including underrun recovery and descriptor wrap. They do not emulate AC97.
+
+`audio_status.py` reads ordinary RAM counters for packet submission/completion,
+rendered buffers, nonzero frames, peak sample magnitude, and the worker's saved
+DMA register snapshots. Use the map matching the deployed build. Do not read
+AC97 MMIO with XBDM `getmem`: its bytewise reads can trigger xemu's
+`nabm_readb` assertion. The driver itself uses supported 32-bit accesses.
 
 `gen_legacy_image.py` needs `capstone` when given `--xbe` (always the case for
 the seeded variant) and exits if it is missing. Point CMake at an interpreter
@@ -97,7 +175,8 @@ Compat files:
 | `crt_string.c` | LIBCMT `__ascii_stricmp` (0x1e3a50), same algorithm as MSVC |
 | `xnet.c` | `XNetStartup`, `WSAStartup`, `XNetGetTitleXnAddr` (static Ethernet), `XNetCleanup`, `WSACleanup` succeed; `socket` returns INVALID_SOCKET, so endpoint creation takes the game's own error path. The debug build asserts if the transport does not come up. |
 | `xapi_input.c` | `XInputDebugGetKeystroke` (`FUN_00252ad9`): always returns `ERROR_HANDLE_EOF` (0x26), as the original does for an empty queue. A 0 stub means "key available" and `input_update_keyboard_devices` spins forever. |
-| `dsound_silent.c` | DirectSound objects that accept every call and never play |
+| `dsound_nxdk.c`, `audio_mixer.c`, `crt/nxdk_audio.c` | DirectSound stream/buffer adapter, PCM/Xbox ADPCM mixer, and nxdk AC97 transport (see Audio). |
+| `dsound_silent.c` | Optional silent backend (`HALO_STANDALONE_AUDIO=OFF`). |
 | `crt/msvc_print.c` | nxdk's `_PDCLIB_print` rebuilt so a NULL `%s` prints `(null)` like MSVC LIBCMT. pdclib calls `strlen(NULL)` and faults; Halo relies on the MSVC behaviour. Built with nxdk's flags (`crt/CMakeLists.txt`) and linked ahead of `libpdclib`. |
 
 Source adaptations (all under `HALO_STANDALONE`, none in reference codegen):
@@ -132,7 +211,7 @@ differently from the inventory, so rows do not always add up exactly.
 | xapi | 40 | 32 stdcall→cdecl winapi bridges, 10 direct nxdk, 1 kernel variable, plus `compat/xapi_*.c` | 6 | Save games (no U: drive yet), remaining launch/signature helpers |
 | crt | 89 | 24 pdclib aliases, 16 direct pdclib/xboxrt | 48 | Mostly unnamed LIBCMT internals (`FUN_001d98xx` = `exit` family, `__open`/`__read`/...). Identify, then alias or compat. |
 | d3d8 | 8 | 1 data symbol, plus `compat/d3d8_*.c` on pbkit | 7 | Push-buffer control (`KickPushBuffer`, `SetPushBufferSize`, `InsertCallback`, `IsBusy`, `BlockOnTime`, `PersistDisplay`). Inside the compat layer, fixed-function combiners, lighting and texture transforms still call `halo_standalone_missing`. |
-| dsound | 30 | `compat/dsound_silent.c` objects | 30 | nxdk has no DirectSound. Needs an AC97/APU mixer compat layer, or silence first. |
+| dsound | 30 | `compat/dsound_nxdk.c` / nxdk AC97 | 30 | Stereo playback is implemented; spatial/DSP entry points remain stubbed. Counts in this historical inventory predate the audio backend. |
 | xnet | 28 | 1 direct nxdk, 1 bridge, plus `compat/xnet.c` | 27 | nxdk lwIP sockets, or stub out system link at first |
 | bink | 63 | 13 data symbols | 50 | Proprietary RAD middleware. Skip intro/attract videos first (stub returns failure), then replace with an open decoder if wanted. |
 | unknown | 37 | nxdk winapi (`CopyFileA`, `Sleep`, ...), `WinMainCRTStartup` | 0 | Done |
@@ -388,7 +467,8 @@ needs push-buffer wrap support in pbkit, or a measured per-frame high-water mark
    push buffer, then `Present` flipping the back buffer. The game writes the
    D3D render-state mirror (`0x1fb6xx`) itself; that stays in the legacy
    layout.
-3. DirectSound: silent compat so the game runs, then real mixing.
+3. DirectSound: stereo software mixing is implemented and audible on xemu.
+   Verify real Xbox playback and performance, then add spatial audio and DSP effects.
 4. Data recovery: move the `halo_data_init` ranges into source-level
    definitions, generated into the legacy layout, until
    `seeded_bytes_from_cachebeta` is 0.

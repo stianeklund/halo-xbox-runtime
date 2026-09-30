@@ -12,6 +12,16 @@ add_custom_command(
     DEPENDS "${CMAKE_SOURCE_DIR}/tools/gen_xnet_profile.py" "${HALO_STANDALONE_LAYOUT_XBE}"
     VERBATIM)
 target_sources(standalone_crt PRIVATE "${gen_dir}/xnet_profile.h")
+if(HALO_STANDALONE_AUDIO)
+	target_sources(standalone_crt PRIVATE ../compat/audio_mixer.c)
+	if(HALO_STANDALONE_AUDIO_BACKEND STREQUAL "apu")
+		include(nxaudio.cmake)
+		target_sources(standalone_crt PRIVATE nxdk_audio_apu.c)
+		target_compile_definitions(standalone_crt PRIVATE HALO_AUDIO_APU=1)
+	else()
+		target_sources(standalone_crt PRIVATE nxdk_audio.c)
+	endif()
+endif()
 set_target_properties(standalone_crt PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
 target_include_directories(standalone_crt BEFORE PRIVATE
 	"${NXDK_DIR}/lib/pdclib"

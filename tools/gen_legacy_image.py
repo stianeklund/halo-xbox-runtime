@@ -59,7 +59,9 @@ def lib_symbols(paths):
                              text=True).stdout
         for line in out.splitlines():
             parts = line.split()
-            if len(parts) >= 2 and parts[1] in 'TDBRWC':
+            # Absolute definitions are linkable symbols too. nxdk exports
+            # __tls_array as A=4 (an FS offset), never as a function address.
+            if len(parts) >= 2 and parts[1] in 'TDBRWCA':
                 names.setdefault(parts[0], os.path.basename(p))
     return names
 
@@ -269,7 +271,7 @@ def main():
                 continue
             if typ == 'U':
                 undefined_raw.setdefault(raw, name)
-            elif typ in 'TDBRCW':
+            elif typ in 'TDBRCWA':
                 defined_raw.setdefault(name, raw)
     defined_names = set(defined_raw)
     lib_defs = lib_symbols([p for p in args.libs.split(',') if p])
