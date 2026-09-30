@@ -96,7 +96,6 @@ set(STANDALONE_COMPAT_SOURCES
 	compat/xapi_fileio.c
 	compat/xapi_heap.c
 	compat/xapi_input.c
-	compat/xnet.c
 	compat/crt_string.c
 	compat/crt_stdio.c
 	compat/crt_wprintf.c
@@ -137,7 +136,8 @@ if(HALO_STANDALONE_TRACE_TEXTURE_STAGES)
 	set_property(SOURCE compat/d3d8_draw.c APPEND PROPERTY COMPILE_DEFINITIONS HALO_STANDALONE_TRACE_TEXTURE_STAGES)
 endif()
 
-file(GENERATE OUTPUT "${gen_dir}/objects.txt" CONTENT "$<JOIN:$<TARGET_OBJECTS:halo>,\n>\n")
+file(GENERATE OUTPUT "${gen_dir}/objects.txt" CONTENT
+	"$<JOIN:$<TARGET_OBJECTS:halo>,\n>\n$<JOIN:$<TARGET_OBJECTS:standalone_crt>,\n>\n$<JOIN:$<TARGET_OBJECTS:standalone_net>,\n>\n")
 
 set(_seed_args)
 if(HALO_STANDALONE_SEED_XBE)
@@ -155,7 +155,8 @@ add_custom_command(
 		--kernel-def "${HALO_ROOT}/src/xboxkrnl.exe.def"
 		--out "${gen_dir}"
 		${_seed_args}
-	DEPENDS halo $<TARGET_OBJECTS:halo> "${STANDALONE_TOOLS}/gen_legacy_image.py"
+	DEPENDS halo standalone_crt standalone_net $<TARGET_OBJECTS:halo> $<TARGET_OBJECTS:standalone_crt> $<TARGET_OBJECTS:standalone_net>
+		"${STANDALONE_TOOLS}/gen_legacy_image.py"
 		"${STANDALONE_TOOLS}/deps_inventory.py" "${HALO_ROOT}/kb.json"
 	VERBATIM
 )
@@ -177,6 +178,8 @@ $<JOIN:$<TARGET_OBJECTS:halo>,
 >
 $<JOIN:$<TARGET_OBJECTS:standalone_crt>,
 >
+$<JOIN:$<TARGET_OBJECTS:standalone_net>,
+>
 \"${gen_dir}/stubs.obj\"
 $<JOIN:${NXDK_LIBS},
 >
@@ -190,7 +193,7 @@ add_custom_command(
 		-map:${PROJECT_BINARY_DIR}/halo.map
 		-out:${PROJECT_BINARY_DIR}/halo.exe "@${_link_rsp}"
 	DEPENDS "${gen_dir}/legacy.obj" "${gen_dir}/stubs.obj" $<TARGET_OBJECTS:halo>
-		$<TARGET_OBJECTS:standalone_crt> ${NXDK_LIBS}
+		$<TARGET_OBJECTS:standalone_crt> $<TARGET_OBJECTS:standalone_net> ${NXDK_LIBS}
 	VERBATIM
 )
 
