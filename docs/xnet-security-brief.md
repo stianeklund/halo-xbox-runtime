@@ -13,9 +13,9 @@ Plain sockets therefore cannot interoperate with an unmodified compatible
 Halo build. [Protocol research](https://hllmn.net/blog/2023-09-18_h1x-net/)
 
 The Xbox kernel supplies crypto primitives through nxdk. The protocol core in
-`compat/xnet_security.c` implements framing, key derivation, session state and
+`compat/xnet/security.c` implements framing, key derivation, session state and
 MAC-based addressing. `crt/nxdk_xnet.c` connects it to lwIP and kernel crypto.
-`compat/xnet.c` preserves Halo's original socket ABI.
+`compat/xnet/xnet.c` preserves Halo's original socket ABI.
 
 ## Target evidence and implemented behavior
 

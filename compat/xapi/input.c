@@ -123,7 +123,7 @@ typedef struct standalone_input_slot {
 static standalone_input_slot input_slots[MAXIMUM_GAMEPADS];
 static uint32_t input_connected_mask;
 static uint32_t input_reported_mask;
-/* The debug keyboard is always port 0; compat/xapi_keyboard.c owns its
+/* The debug keyboard is always port 0; compat/xapi/keyboard.c owns its
    keystroke queue, so the handle is only a non-null token for Halo. */
 static uint32_t keyboard_reported_mask;
 static uint8_t keyboard_handle;

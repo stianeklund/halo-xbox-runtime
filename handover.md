@@ -37,7 +37,7 @@ effects-image/I3DL2 reverb, and Bink audio remain unimplemented.
 
 ## Important files and fixes
 
-- `compat/dsound_nxdk.c`, `compat/audio_mixer.*`, `compat/audio_backend.h`:
+- `compat/audio/dsound_nxdk.c`, `compat/audio/mixer.*`, `compat/audio/backend.h`:
   DirectSound ABI, four-packet ring, game callbacks, software fallback.
 - `crt/nxdk_audio_apu.c`: APU adapter; two hardware slots per voice, contiguous
   staging, worker polling, synchronous flush with stop-timeout ownership safety.

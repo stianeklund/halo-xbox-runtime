@@ -4,7 +4,7 @@ Standalone original-Xbox build of the reconstructed Halo CE source, linked
 against [nxdk](https://github.com/XboxDev/nxdk) instead of the Microsoft XDK.
 
 This repository contains only the nxdk-side pieces: XDK compatibility layers
-(`compat/`), CRT fixups (`crt/`), the runtime entry (`standalone_runtime.c`),
+(`compat/`, one folder per library), CRT fixups (`crt/`), the runtime entry (`standalone_runtime.c`),
 and the build and debug tools (`tools/`). The game code, `kb.json` and the
 reference build tooling come from a halo checkout, which you point at with
 `HALO_ROOT`. Any halo checkout or worktree works.
@@ -22,7 +22,9 @@ which sets the variables above to local defaults (see `./build.sh --help`).
 Audio is enabled by default: PCM and Xbox ADPCM use the
 [nxdk-audio APU backend](docs/audio-apu.md) for hardware stereo playback.
 Distance/cone attenuation, occlusion levels, and stereo panning are approximated.
-HRTF filtering, DSP reverb, and Bink movie audio remain unsupported.
+HRTF filtering and DSP reverb remain unsupported.
+Bink movies (intro, attract, credits) play through an open decoder in
+[`compat/bink/`](docs/bink.md); see that page for licensing.
 Audible playback was confirmed on xemu;
 real Xbox hardware remains unverified.
 Configure with `-DHALO_STANDALONE_AUDIO=OFF` to use the silent backend.

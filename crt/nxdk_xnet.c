@@ -2,7 +2,7 @@
  * APIs and timer/input/output callbacks hold lwIP's core lock. The NIC ISR
  * only enqueues pbufs; no crypto or session mutation runs in interrupt context.
  */
-#include "../compat/xnet_security.h"
+#include "../compat/xnet/security.h"
 #include "xnet_profile.h"
 #include <lwip/inet_chksum.h>
 #include <lwip/ip4.h>

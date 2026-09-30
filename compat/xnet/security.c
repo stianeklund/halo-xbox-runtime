@@ -1,7 +1,7 @@
 /* cachebeta XNET protocol. Evidence addresses and wire fixtures are documented
  * in docs/xnet-security-brief.md. No retail constants or game-message parsing.
  */
-#include "xnet_security.h"
+#include "security.h"
 #include <limits.h>
 #include <string.h>
 const uint8_t xsec_modulus[96] = {

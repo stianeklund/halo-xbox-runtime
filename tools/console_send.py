@@ -10,7 +10,7 @@ decoded, '`' or '~' toggles the console, '\\n' presses Enter and {NAME}
 presses a named key: {F1}..{F12}, {ESC}, {TAB}, {BACKSPACE}, {ENTER},
 {UP}, {DOWN}, {LEFT}, {RIGHT}, {HOME}, {END}, {PGUP}, {PGDN}, {INSERT},
 {DELETE}, {PRINTSCREEN}, {PAUSE}; {{ types a '{'. Both work without a
-keyboard attached. Writes compat/xapi_keyboard.c's
+keyboard attached. Writes compat/xapi/keyboard.c's
 halo_remote_console mailbox, located through the map of the deployed build.
 """
 import argparse

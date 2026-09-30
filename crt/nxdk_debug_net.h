@@ -1,6 +1,6 @@
 #ifndef HALO_NXDK_DEBUG_NET_H
 #define HALO_NXDK_DEBUG_NET_H
-#include "../compat/xnet.h"
+#include "../compat/xnet/xnet.h"
 #include <lwip/netif.h>
 
 /* Select the resident debugger's NIC when present, otherwise nxdk's driver. */

@@ -2,7 +2,7 @@
  * title's audio lock, on threads that may use the FPU, never from a DPC. */
 #ifndef HALO_AUDIO_BACKEND_H
 #define HALO_AUDIO_BACKEND_H
-#include "audio_mixer.h"
+#include "mixer.h"
 #ifdef HALO_AUDIO_APU
 int audio_output_create(struct audio_voice *v, int stream);
 void audio_output_destroy(struct audio_voice *v);

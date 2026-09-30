@@ -1,4 +1,4 @@
-#include "audio_mixer.h"
+#include "mixer.h"
 
 static const int ima_steps[89] = {
   7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,45,50,55,60,

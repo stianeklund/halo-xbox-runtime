@@ -99,29 +99,37 @@ add_compile_definitions(HDATA=extern HALO_STANDALONE=1)
 # Compatibility layers standing in for XDK libraries statically linked into
 # cachebeta.xbe (XAPILIB, D3D8, DSOUND, XNET, ...). One file per library area.
 set(STANDALONE_COMPAT_SOURCES
-	compat/d3d8_device.c
-	compat/d3d8_state.c
-	compat/d3d8_draw.c
-	compat/xapi_fileio.c
-	compat/xapi_heap.c
-	compat/xapi_input.c
-	compat/xapi_keyboard.c
-	compat/crt_string.c
-	compat/crt_stdio.c
-	compat/crt_wprintf.c
-	compat/xapi_init.c
-	compat/xapi_launch.c
-	compat/xapi_memory.c
-	compat/xapi_savegame.c
-	compat/xapi_nickname.c
-	compat/xapi_signature.c
-	compat/xapi_thread.c
-	compat/xapi_xvutil.c
+	compat/d3d8/device.c
+	compat/d3d8/state.c
+	compat/d3d8/draw.c
+	compat/xapi/fileio.c
+	compat/xapi/heap.c
+	compat/xapi/input.c
+	compat/xapi/keyboard.c
+	compat/crt/string.c
+	compat/crt/stdio.c
+	compat/crt/wprintf.c
+	compat/xapi/init.c
+	compat/xapi/launch.c
+	compat/xapi/memory.c
+	compat/xapi/savegame.c
+	compat/xapi/nickname.c
+	compat/xapi/signature.c
+	compat/xapi/thread.c
+	compat/xapi/xvutil.c
+	compat/bink/audio.c
+	compat/bink/blit.c
+	compat/bink/file.c
+	compat/bink/memory.c
+	compat/bink/playback.c
+	compat/bink/radcb.c
+	compat/bink/sound.c
+	compat/bink/video.c
 )
 if(HALO_STANDALONE_AUDIO)
-	list(APPEND STANDALONE_COMPAT_SOURCES compat/dsound_nxdk.c)
+	list(APPEND STANDALONE_COMPAT_SOURCES compat/audio/dsound_nxdk.c)
 else()
-	list(APPEND STANDALONE_COMPAT_SOURCES compat/dsound_silent.c compat/dsound_stream_controls.c)
+	list(APPEND STANDALONE_COMPAT_SOURCES compat/audio/dsound_silent.c compat/audio/dsound_stream_controls.c)
 endif()
 list(TRANSFORM STANDALONE_COMPAT_SOURCES PREPEND "${CMAKE_CURRENT_LIST_DIR}/")
 add_library(halo OBJECT "${gen_dir}/build_info.c" "${CMAKE_CURRENT_LIST_DIR}/standalone_runtime.c"
@@ -146,12 +154,12 @@ set(NXDK_LIBS
 )
 string(REPLACE ";" "," _nxdk_libs_arg "${NXDK_LIBS}")
 # nxdk's NV2A method names (defines only) for the pbkit-backed D3D device.
-set_source_files_properties(compat/d3d8_device.c compat/d3d8_state.c compat/d3d8_draw.c PROPERTIES COMPILE_OPTIONS "-I${NXDK_DIR}/lib/pbkit")
+set_source_files_properties(compat/d3d8/device.c compat/d3d8/state.c compat/d3d8/draw.c PROPERTIES COMPILE_OPTIONS "-I${NXDK_DIR}/lib/pbkit")
 if(NOT HALO_STANDALONE_GPU_STATE)
-	set_property(SOURCE compat/d3d8_state.c compat/d3d8_draw.c APPEND PROPERTY COMPILE_DEFINITIONS HALO_STANDALONE_NO_GPU_STATE)
+	set_property(SOURCE compat/d3d8/state.c compat/d3d8/draw.c APPEND PROPERTY COMPILE_DEFINITIONS HALO_STANDALONE_NO_GPU_STATE)
 endif()
 if(HALO_STANDALONE_TRACE_TEXTURE_STAGES)
-	set_property(SOURCE compat/d3d8_draw.c APPEND PROPERTY COMPILE_DEFINITIONS HALO_STANDALONE_TRACE_TEXTURE_STAGES)
+	set_property(SOURCE compat/d3d8/draw.c APPEND PROPERTY COMPILE_DEFINITIONS HALO_STANDALONE_TRACE_TEXTURE_STAGES)
 endif()
 
 file(GENERATE OUTPUT "${gen_dir}/objects.txt" CONTENT

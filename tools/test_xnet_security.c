@@ -1,5 +1,5 @@
 /* Real protocol core + independent original-XNET fixtures + queued peers. */
-#include "../compat/xnet_security.h"
+#include "../compat/xnet/security.h"
 #include "xnet_fixtures.h"
 #include <assert.h>
 #include <openssl/bn.h>

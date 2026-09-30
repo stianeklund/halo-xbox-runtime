@@ -12,7 +12,7 @@ with tempfile.TemporaryDirectory(prefix="halo-nickname-") as directory:
     subprocess.run([
         *shlex.split(os.environ.get("CC", "cc")), "-std=c89", "-Wall", "-Wextra",
         "-Werror", "-DHALO_NICKNAME_HOST_TEST", "-fsanitize=address,undefined", "-g",
-        str(root / "compat/xapi_nickname.c"), str(root / "tools/test_nickname.c"),
+        str(root / "compat/xapi/nickname.c"), str(root / "tools/test_nickname.c"),
         "-o", str(binary),
     ], check=True)
     subprocess.run([str(binary)], check=True, timeout=15)

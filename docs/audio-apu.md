@@ -6,7 +6,7 @@ It retains Halo's DirectSound ABI, packet callbacks, and synchronous flush
 behavior. APU is the default backend; software remains an explicit fallback.
 
 This milestone uses the driver's 192 2D voice slots. Both audible backends
-approximate DirectSound 3D in `compat/dsound_nxdk.c`: listener/source
+approximate DirectSound 3D in `compat/audio/dsound_nxdk.c`: listener/source
 positions, inverse distance rolloff clamped at max distance, cones, deferred
 updates committed once per frame, the I3DL2 direct level with occlusion and
 obstruction at their low-frequency ratio, front mix-bin volumes, and a stereo

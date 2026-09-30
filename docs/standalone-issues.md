@@ -61,7 +61,7 @@ The `rev` banner alone does not identify which seeded executable was running.
 `connection` argument is nonzero at original source line `0x330` (816).
 Location: `/mnt/g/dev/halo/src/halo/networking/network_connection.c:197`.
 
-**Original confirmed cause in standalone source:** `compat/xnet.c` supplied
+**Original confirmed cause in standalone source:** `compat/xnet/xnet.c` supplied
 successful startup placeholders while `xnet_socket` always returned `-1`.
 Other required Winsock calls used generated stubs. Halo's
 `network_connection_new` already has an implementation in main and is marked

@@ -3,7 +3,7 @@
 #include <windows.h>
 #include <hal/audio.h>
 #include <xboxkrnl/xboxkrnl.h>
-#include "../compat/audio_mixer.h"
+#include "../compat/audio/mixer.h"
 
 #define AUDIO_FRAMES 1024
 #define AUDIO_BUFFERS 3

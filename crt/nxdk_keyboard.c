@@ -1,8 +1,8 @@
-/* Keyboard reports for the XAPI debug keyboard compat (compat/xapi_keyboard.c).
+/* Keyboard reports for the XAPI debug keyboard compat (compat/xapi/keyboard.c).
  *
  * Two devices produce the same 8-byte report (modifiers, reserved, 6 usages):
  * a USB HID keyboard in boot protocol, read here, and an XID debug keyboard
- * (XID type 2, e.g. xemu's), read by compat/xapi_input.c. nxdk's prebuilt
+ * (XID type 2, e.g. xemu's), read by compat/xapi/input.c. nxdk's prebuilt
  * nxdk_usb.lib omits the HID class driver, so crt/CMakeLists.txt compiles it
  * next to this file.
  *

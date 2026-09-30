@@ -1,5 +1,5 @@
 /* Integration tests run the real Winsock adapter over host BSD sockets. */
-#include "../compat/xnet.h"
+#include "../compat/xnet/xnet.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>

@@ -2,7 +2,7 @@
 """Capture the framebuffers of a running standalone build as PNGs.
 
 XBDM `screenshot` cannot find nxdk's screen buffer. The compat D3D device
-(compat/d3d8_device.c, DEVICE_ADDRESS 0x1fbb10) scans out its own
+(compat/d3d8/device.c, DEVICE_ADDRESS 0x1fbb10) scans out its own
 back/front surfaces, whose headers sit at device+0x2150 in 0x18-byte slots
 (slot 0 back, slot 1 front, Data = physical address at +4). This pulls those
 with getmem; --pbkit reads pbkit's own (unused) framebuffer table instead.

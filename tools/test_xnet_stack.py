@@ -72,7 +72,7 @@ ULONG XcModExp(ULONG *, ULONG *, ULONG *, ULONG *, ULONG);
         'static const unsigned char halo_title_lan_key[16] = "TESTTESTTESTTEST";\n')
     sources = sorted((lwip / "core").glob("*.c"))
     sources += sorted((lwip / "core/ipv4").glob("*.c"))
-    sources += [lwip / "netif/ethernet.c", root / "compat/xnet_security.c",
+    sources += [lwip / "netif/ethernet.c", root / "compat/xnet/security.c",
                 root / "crt/nxdk_xnet.c", root / "tools/test_xnet_stack.c",
                 root / "tools/test_debug_net.c"]
     binary = temp / "test-stack"

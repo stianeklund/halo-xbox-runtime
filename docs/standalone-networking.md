@@ -16,7 +16,7 @@ cachebeta System Link. Cleanup closes Halo's sockets and clears session keys;
 a later startup reuses the worker
 because nxdk does not implement worker teardown.
 
-`compat/xnet.c` translates the original Xbox Winsock ABI to lwIP:
+`compat/xnet/xnet.c` translates the original Xbox Winsock ABI to lwIP:
 
 - IPv4 sockaddr and count-plus-array fd sets, including Halo's `select(1)`.
 - TCP/UDP creation, binding, listening, accepting, connecting, and I/O.
@@ -29,7 +29,7 @@ lwIP's send capacity is fixed at compile time. `SO_SNDBUF` queries report
 that capacity; changing it per socket returns an unsupported-option error.
 Halo's requested 16 KiB fits the configured capacity.
 
-`compat/xnet_security.c` implements cachebeta 2276 System Link security: encrypted
+`compat/xnet/security.c` implements cachebeta 2276 System Link security: encrypted
 broadcasts, authenticated DH handshakes, directional session keys, DES/3DES-CBC
 packet framing, replay checks and reconnect state. `crt/nxdk_xnet.c` wraps inner
 TCP/UDP segments in Ethernet-addressed UDP 3074 packets and delivers verified

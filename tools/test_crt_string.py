@@ -48,7 +48,7 @@ with tempfile.TemporaryDirectory(prefix="halo-crt-string-") as directory:
     subprocess.run([
         *shlex.split(os.environ.get("CC", "cc")), "-std=c89", "-Wall", "-Wextra",
         "-Werror", "-fshort-wchar", "-fPIC", "-shared",
-        str(root / "compat/crt_string.c"), "-o", str(library),
+        str(root / "compat/crt/string.c"), "-o", str(library),
     ], check=True)
     crt = ctypes.CDLL(str(library))
     compare = crt.__wcsnicmp

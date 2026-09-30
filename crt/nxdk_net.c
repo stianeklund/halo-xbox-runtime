@@ -1,5 +1,5 @@
 /* Initialise NIC/lwIP once: nxdk has no TCP/IP-worker teardown support. */
-#include "../compat/xnet.h"
+#include "../compat/xnet/xnet.h"
 #include "nxdk_debug_net.h"
 #include <lwip/dhcp.h>
 #include <lwip/netifapi.h>

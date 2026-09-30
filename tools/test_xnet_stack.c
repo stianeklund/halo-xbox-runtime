@@ -1,4 +1,4 @@
-#include "../compat/xnet_security.h"
+#include "../compat/xnet/security.h"
 #include <lwip/init.h>
 #include <lwip/ip4.h>
 #include <lwip/tcpip.h>

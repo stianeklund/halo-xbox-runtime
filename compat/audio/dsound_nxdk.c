@@ -4,8 +4,9 @@
  * 3D sources get distance, cone, occlusion and stereo pan gains; HRTF,
  * Doppler, reverb, DSP effects and surround mix bins remain unsupported. */
 #include "xbox.h"
-#include "audio_mixer.h"
-#include "audio_backend.h"
+#include "mixer.h"
+#include "backend.h"
+#include "pcm_stream.h"
 
 #define DS_OK 0
 #define DS_INVALID ((int)0x80070057)
@@ -880,4 +881,85 @@ bool dsound_channel_queue_packet(short channel_index)
     if (*(short *)channel == 2) *(short *)channel = 1;
   } else *(unsigned int *)(channel + 0x64) = offset + chunk;
   return true;
+}
+
+/* PCM streams for Bink movie audio: an ordinary callback-less stream whose
+ * completions its owner retires, so no game callback runs off-thread. */
+struct pcm_stream *pcm_stream_open(unsigned int rate, unsigned int channels, unsigned int bits)
+{
+  struct audio_format format;
+  struct sound_object *o;
+  csmemset(&format, 0, sizeof(format));
+  format.tag = 1;
+  format.channels = (unsigned short)channels;
+  format.rate = rate;
+  format.bits = (unsigned short)bits;
+  format.block_align = (unsigned short)(channels * bits / 8);
+  format.bytes_per_second = rate * format.block_align;
+  if (create_object(&format, 1, 0, &o)) return NULL;
+  standalone_audio_lock();
+  if (audio_output_pause(&o->voice, 1)) o->voice.paused = 1;
+  standalone_audio_unlock();
+  return (struct pcm_stream *)o;
+}
+
+int pcm_stream_submit(struct pcm_stream *stream, const void *data, unsigned int size,
+                      volatile unsigned int *status)
+{
+  struct media_packet packet;
+  csmemset(&packet, 0, sizeof(packet));
+  packet.data = data;
+  packet.size = size;
+  packet.status = (unsigned int *)status;
+  return stream_process(stream, &packet, NULL) == DS_OK;
+}
+
+void pcm_stream_retire(struct pcm_stream *stream)
+{
+  struct sound_object *o = (struct sound_object *)stream;
+  struct audio_packet packet;
+  standalone_audio_lock();
+  audio_output_poll(&o->voice);
+  while (audio_voice_completion(&o->voice, &packet)) {}
+  update_status(o);
+  standalone_audio_unlock();
+}
+
+int pcm_stream_active(struct pcm_stream *stream)
+{
+  struct sound_object *o = (struct sound_object *)stream;
+  int active;
+  standalone_audio_lock();
+  active = audio_voice_active(&o->voice);
+  standalone_audio_unlock();
+  return active;
+}
+
+int pcm_stream_pause(struct pcm_stream *stream, int pause)
+{
+  return nxds_pause(stream, pause ? 1 : 0) == DS_OK;
+}
+
+void pcm_stream_volume(struct pcm_stream *stream, int volume)
+{
+  IDirectSoundStream_SetVolume(stream, volume);
+}
+
+int pcm_stream_flush(struct pcm_stream *stream)
+{
+  struct sound_object *o = (struct sound_object *)stream;
+  int stopped;
+  standalone_audio_lock();
+  stopped = audio_output_flush(&o->voice);
+  update_status(o);
+  standalone_audio_unlock();
+  if (stopped) pcm_stream_retire(stream);
+  return stopped;
+}
+
+int pcm_stream_close(struct pcm_stream *stream)
+{
+  /* Release keeps the object, and so its packet memory, if DMA may still
+   * read it; otherwise DirectSoundDoWork unlinks and frees it. */
+  return object_release(stream) == 0;
 }

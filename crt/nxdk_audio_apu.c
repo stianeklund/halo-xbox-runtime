@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "audio_internal.h"
-#include "../compat/audio_backend.h"
+#include "../compat/audio/backend.h"
 
 struct apu_voice {
     nxAudioVoice hardware;

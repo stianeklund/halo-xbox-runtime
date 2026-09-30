@@ -35,7 +35,7 @@ cmake --build build --target standalone_inventory   # -> deps_inventory.json
 
 ## Audio
 
-`HALO_STANDALONE_AUDIO` defaults to `ON`. `compat/dsound_nxdk.c` implements
+`HALO_STANDALONE_AUDIO` defaults to `ON`. `compat/audio/dsound_nxdk.c` implements
 the Xbox DirectSound entry-point ABI and stream vtables used by Halo.
 `HALO_STANDALONE_AUDIO_BACKEND` defaults to `apu`. This experimental
 backend shares this adapter and uses nxdk-audio hardware voices.
@@ -44,7 +44,7 @@ caches retain their selected backend; pass `-DHALO_STANDALONE_AUDIO_BACKEND=apu`
 to switch them. `./build.sh` selects APU unless the backend environment variable
 requests software. See [audio-apu.md](audio-apu.md) for its build steps,
 local driver patches, validation, and remaining feature gaps.
-`compat/audio_mixer.c` decodes mono/stereo 8/16-bit PCM and Xbox IMA ADPCM
+`compat/audio/mixer.c` decodes mono/stereo 8/16-bit PCM and Xbox IMA ADPCM
 (format `0x69`, 36 bytes per channel, 64 samples per block), resamples to
 48 kHz, applies volume/pitch, mixes voices, and clips to signed 16-bit stereo.
 Static buffers support playback, stop, seek, and looping.
@@ -69,8 +69,8 @@ Channel offsets and packet splitting were checked against build 2276 at
 `0x1c9670` and `0x1cb210`. The reference Halo checkout is not modified.
 
 This is a stereo playback implementation. Spatial positioning/attenuation,
-HRTF, Doppler, DSP reverb, surround mix bins, and Bink movie sound remain
-unsupported; their existing entry-point stubs are visible in `link_report.json`.
+HRTF, Doppler, DSP reverb, and surround mix bins remain
+unsupported (Bink movie sound streams through `compat/bink/sound.c`); their existing entry-point stubs are visible in `link_report.json`.
 Audible playback was confirmed on xemu on 2026-09-30. A channel-reuse completion
 defect caused rapid plasma-pistol fire to drop effects; the user confirmed that
 the fix resolves that gameplay issue. Subtle level/mixing differences remain
@@ -156,9 +156,9 @@ reached. That list is the burn-down queue.
 | Legacy data | legacy layout, `.rdata`/`.data` range | Zero-filled. kb.json data symbols resolve to their original VAs, so named and raw-address accesses agree. With `HALO_STANDALONE_SEED_XBE`, the initialized bytes come from that XBE (dev only). |
 | Stubs | `generated/stubs.s` | One per unresolved function. Each logs its name once (`halo_standalone_missing`) and returns 0. It pops what the original's `ret N` pops (`original_pops`: a capstone walk of the original body, counted as `stub_pops_from_ret`), else the callee-pops size taken from the symbol decoration. A stub that pops the wrong amount skews ESP and the caller later returns to 0. |
 | Unknown-function stubs | `generated/legacy.s` | Code addresses stored in `.rdata`/`.data` that are not kb.json function starts (`unknown_data_referenced_functions`). The previous kb function never reaches them, and a padding byte or `ret` precedes them. Without an entry, a call slides into the next trampoline and runs the wrong function. Each gets a `__halo_legacy_<va>` logging stub (`unknown_function_stub` in `link_report.json`). The 368 Ghidra-confirmed ones are now in kb.json `<common>` as `FUN_<addr>`, so they become ordinary missing stubs. |
-| Bridges | `generated/stubs.s` | `__stdcall` XDK names go to nxdk's cdecl winapi. kb.json `void X(void)` placeholders are never bridged: they say nothing about the real arguments (RaiseException, PulseEvent), so those get typed entries in `compat/xapi_thread.c`. LIBCMT `crt_X` names go to pdclib `X`. Original `jmp [kernel thunk]` / `mov eax,[thunk]` routines go to kernel imports. |
-| Compat layers | `compat/*.c` | Hand-written replacements for XDK library routines, transcribed from the binary where they are thin wrappers. One file per library area (see below). |
-| Entry | `standalone_entry` (`compat/xapi_init.c`) | Does what `XapiInitProcess` does for Halo's init flags (mounts the utility drive `Z:` using the XAPI cache-partition database), then enters nxdk's `WinMainCRTStartup`. |
+| Bridges | `generated/stubs.s` | `__stdcall` XDK names go to nxdk's cdecl winapi. kb.json `void X(void)` placeholders are never bridged: they say nothing about the real arguments (RaiseException, PulseEvent), so those get typed entries in `compat/xapi/thread.c`. LIBCMT `crt_X` names go to pdclib `X`. Original `jmp [kernel thunk]` / `mov eax,[thunk]` routines go to kernel imports. |
+| Compat layers | `compat/<library>/` | Hand-written replacements for XDK library routines, transcribed from the binary where they are thin wrappers. One folder per library: `audio` (DirectSound and the mixer), `bink`, `crt`, `d3d8`, `xapi`, `xnet` (see below). |
+| Entry | `standalone_entry` (`compat/xapi/init.c`) | Does what `XapiInitProcess` does for Halo's init flags (mounts the utility drive `Z:` using the XAPI cache-partition database), then enters nxdk's `WinMainCRTStartup`. |
 | nxdk | `libwinapi`, `libxboxkrnl`, `libxboxrt`, `libpdclib`, `libnxdk{,_hal,_automount_d}` | CRT startup (`WinMainCRTStartup` → Halo `main`), kernel imports, D: automount. |
 | Post-link | `tools/xbe_make_writable.py` | cxbe marks `.text` read-only. The legacy data lives there, so the step sets the writable flag. It also clears cxbe's 64MB-limit init flag to match the original's flags (0x1), because the debug build needs devkit memory. |
 
@@ -211,12 +211,12 @@ differently from the inventory, so rows do not always add up exactly.
 | halo_code | 160 | 9 empty bodies (the original is a lone `ret`) | 151 | Lift with `/lift` (the closure below lists 395 in total) |
 | halo_data | 172 | 172 → legacy VAs | 0 | Recover initializers for the initialized range (see layer 2) |
 | kernel | 43 | nxdk libxboxkrnl | 0 | Done |
-| xapi | 40 | 32 stdcall→cdecl winapi bridges, 10 direct nxdk, 1 kernel variable, plus `compat/xapi_*.c` | 6 | Save games (no U: drive yet), remaining launch/signature helpers |
+| xapi | 40 | 32 stdcall→cdecl winapi bridges, 10 direct nxdk, 1 kernel variable, plus `compat/xapi/` | 6 | Save games (no U: drive yet), remaining launch/signature helpers |
 | crt | 89 | 24 pdclib aliases, 16 direct pdclib/xboxrt | 48 | Mostly unnamed LIBCMT internals (`FUN_001d98xx` = `exit` family, `__open`/`__read`/...). Identify, then alias or compat. |
-| d3d8 | 8 | 1 data symbol, plus `compat/d3d8_*.c` on pbkit | 7 | Push-buffer control (`KickPushBuffer`, `SetPushBufferSize`, `InsertCallback`, `IsBusy`, `BlockOnTime`, `PersistDisplay`). Inside the compat layer, fixed-function combiners, lighting and texture transforms still call `halo_standalone_missing`. |
-| dsound | 30 | `compat/dsound_nxdk.c` / nxdk AC97 | 30 | Stereo playback is implemented; spatial/DSP entry points remain stubbed. Counts in this historical inventory predate the audio backend. |
-| xnet | 28 | 1 direct nxdk, 1 bridge, plus `compat/xnet.c` | 27 | nxdk lwIP sockets, or stub out system link at first |
-| bink | 63 | 13 data symbols | 50 | Proprietary RAD middleware. Skip intro/attract videos first (stub returns failure), then replace with an open decoder if wanted. |
+| d3d8 | 8 | 1 data symbol, plus `compat/d3d8/` on pbkit | 7 | Push-buffer control (`KickPushBuffer`, `SetPushBufferSize`, `InsertCallback`, `IsBusy`, `BlockOnTime`, `PersistDisplay`). Inside the compat layer, fixed-function combiners, lighting and texture transforms still call `halo_standalone_missing`. |
+| dsound | 30 | `compat/audio/dsound_nxdk.c` / nxdk AC97 | 30 | Stereo playback is implemented; spatial/DSP entry points remain stubbed. Counts in this historical inventory predate the audio backend. |
+| xnet | 28 | 1 direct nxdk, 1 bridge, plus `compat/xnet/xnet.c` | 27 | nxdk lwIP sockets, or stub out system link at first |
+| bink | 63 | 13 data symbols, plus `compat/bink/` | 0 | Done: open Bink 1 decoder and RAD runtime glue; see [bink.md](bink.md). |
 | unknown | 37 | nxdk winapi (`CopyFileA`, `Sleep`, ...), `WinMainCRTStartup` | 0 | Done |
 
 **Layer 2: fixed image addresses** compiled into our code (`*(T *)0x2c84c0`,
@@ -230,7 +230,7 @@ what data must be reconstructed:
 | halo_data_init | 1,294 | Needs recovered initial contents (strings, tables, float constants) |
 | maybe_constant | 1,072 | In-range immediate with no kb symbol. Probably plain integers; review. |
 | halo_code | 341 | Code addresses used as values. Served by the trampolines. |
-| d3d8 / xapi / crt / dsound / bink / unknown | 313 / 37 / 10 / 2 / 1 / 9 | Library internals reached by raw address; handled with each library. Most d3d8 sites are in `compat/d3d8_draw.c` (350 sites), which uses XDK const tables and the render-state mirror at their original VAs. |
+| d3d8 / xapi / crt / dsound / bink / unknown | 313 / 37 / 10 / 2 / 1 / 9 | Library internals reached by raw address; handled with each library. Most d3d8 sites are in `compat/d3d8/draw.c` (350 sites), which uses XDK const tables and the render-state mirror at their original VAs. |
 
 Initialized data that the unseeded image currently lacks: `.rdata` 0x75430 bytes
 and `.data` 0x69a3c bytes (plus DOLBY 0x6d84 and BINKDATA 0x4250). Seeded runs
@@ -299,7 +299,7 @@ Earlier blockers, now fixed:
   `IDirectSound_CreateSoundStream`, which the channel code asserts on.
 - `'levels\ui\ui' does not appear to be a cache file`: the LIBCMT
   `__ascii_stricmp` stub returned 0, so every cache slot name "matched". It is
-  now in `compat/crt_string.c`. `crt_sprintf` was stubbed too; the bridge now
+  now in `compat/crt/string.c`. `crt_sprintf` was stubbed too; the bridge now
   maps kb.json `crt_X` names in multi-function LIBCMT objects to pdclib `X`.
   The MSVC-vs-C99 differences of the aliased `snprintf`/`vsnprintf` (MSVC
   `_snprintf` returns -1 and skips the terminator on truncation) and of `rand`
@@ -307,7 +307,7 @@ Earlier blockers, now fixed:
 - The cache copy thread asserted in `FUN_001ba930` (the write-completion wait
   at tags.c 0x5d6/0x5da/0x5db). The Z: cache slot picker `FUN_001bd210` and the
   profile writers `FUN_001c31f0` / `FUN_001c19e0` are now lifted. After that,
-  `compat/xapi_fileio.c` still passed the import library's jmp thunk as the
+  `compat/xapi/fileio.c` still passed the import library's jmp thunk as the
   APC routine, because the vendored header declares `NtUserIoApcDispatcher`
   without dllimport. On xemu the kernel then ran the completion as a kernel APC
   at arbitrary points: the alertable `WaitForSingleObjectEx` timed out instead
@@ -346,7 +346,7 @@ Earlier blockers, now fixed:
   custom command's DEPENDS on another target's objects does not order the
   build. `CMakeLists.txt` now adds a target-level dependency.
 - `telnet_console_initialize` asserted `transport_initialized` because the
-  XNet stubs never reported a link; `compat/xnet.c` now covers this.
+  XNet stubs never reported a link; `compat/xnet/xnet.c` now covers this.
 
 Link report for that image: implemented 5500, jmp_thunk 51, kernel_forwarder
 152, library_bridge 47, missing_stub 2478, reverse_thunk 913,
@@ -475,6 +475,6 @@ needs push-buffer wrap support in pbkit, or a measured per-frame high-water mark
 4. Data recovery: move the `halo_data_init` ranges into source-level
    definitions, generated into the legacy layout, until
    `seeded_bytes_from_cachebeta` is 0.
-5. XNet, Bink: stub first, replace later.
+5. XNet: stub first, replace later. (Bink is done, see [bink.md](bink.md).)
 6. Once nothing is stubbed or seeded, `build/default.xbe` is the
    standalone deliverable.

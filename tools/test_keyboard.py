@@ -12,7 +12,7 @@ with tempfile.TemporaryDirectory(prefix="halo-keyboard-") as directory:
     subprocess.run([
         *shlex.split(os.environ.get("CC", "cc")), "-std=c99", "-Wall", "-Wextra",
         "-Werror", "-DHALO_KEYBOARD_HOST_TEST", "-fsanitize=address,undefined", "-g",
-        str(root / "compat/xapi_keyboard.c"), str(root / "tools/test_keyboard.c"),
+        str(root / "compat/xapi/keyboard.c"), str(root / "tools/test_keyboard.c"),
         "-o", str(binary),
     ], check=True)
     subprocess.run([str(binary)], check=True, timeout=15)

@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix="halo-network-") as directory:
         *shlex.split(os.environ.get("CC", "cc")),
         "-std=c11", "-Wall", "-Wextra", "-Werror",
         "-DHALO_NETWORK_HOST_TEST", "-fsanitize=address,undefined", "-g", "-pthread",
-        str(root / "compat/xnet.c"), str(root / "tools/test_network.c"),
+        str(root / "compat/xnet/xnet.c"), str(root / "tools/test_network.c"),
         "-o", str(binary),
     ], check=True)
     subprocess.run([str(binary)], check=True, timeout=15)

@@ -8,6 +8,7 @@
  * producing audio.
  */
 #include "xbox.h"
+#include "pcm_stream.h"
 
 #define DS_OK 0
 #define E_OUTOFMEMORY 0x8007000e
@@ -181,4 +182,59 @@ long __stdcall standalone_IDirectSound_CreateSoundStream(void *dsound, const voi
   (void)desc;
   (void)outer;
   return new_stream(out_stream);
+}
+
+/* Nothing is audible, so Bink movies open without a sound track. */
+struct pcm_stream *pcm_stream_open(unsigned int rate, unsigned int channels, unsigned int bits)
+{
+  (void)rate;
+  (void)channels;
+  (void)bits;
+  return NULL;
+}
+
+int pcm_stream_submit(struct pcm_stream *stream, const void *data, unsigned int size,
+                      volatile unsigned int *status)
+{
+  (void)stream;
+  (void)data;
+  (void)size;
+  (void)status;
+  return 0;
+}
+
+void pcm_stream_retire(struct pcm_stream *stream)
+{
+  (void)stream;
+}
+
+int pcm_stream_active(struct pcm_stream *stream)
+{
+  (void)stream;
+  return 0;
+}
+
+int pcm_stream_pause(struct pcm_stream *stream, int pause)
+{
+  (void)stream;
+  (void)pause;
+  return 1;
+}
+
+void pcm_stream_volume(struct pcm_stream *stream, int volume)
+{
+  (void)stream;
+  (void)volume;
+}
+
+int pcm_stream_flush(struct pcm_stream *stream)
+{
+  (void)stream;
+  return 1;
+}
+
+int pcm_stream_close(struct pcm_stream *stream)
+{
+  (void)stream;
+  return 1;
 }

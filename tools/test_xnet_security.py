@@ -36,6 +36,6 @@ with tempfile.TemporaryDirectory(prefix='halo-xnet-security-') as temp:
     binary = temp / 'test-xnet'
     subprocess.run([*shlex.split(os.environ.get('CC', 'cc')), '-std=c11', '-Wall', '-Wextra', '-Werror',
                     '-DHALO_NETWORK_HOST_TEST', '-fsanitize=address,undefined', '-g', '-I'+str(temp),
-                    str(root / 'compat/xnet_security.c'), str(root / 'tools/test_xnet_security.c'),
+                    str(root / 'compat/xnet/security.c'), str(root / 'tools/test_xnet_security.c'),
                     '-lcrypto', '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=60)

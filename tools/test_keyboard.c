@@ -1,4 +1,4 @@
-/* Host tests for compat/xapi_keyboard.c: HID report diffing, repeat, the
+/* Host tests for compat/xapi/keyboard.c: HID report diffing, repeat, the
  * remote console mailbox and the queue contract Halo's drain loop relies on. */
 #include <assert.h>
 #include <stdint.h>
