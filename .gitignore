@@ -3,6 +3,7 @@ artifacts/
 __pycache__/
 *.pyc
 .tmp*/
+tmp*/
 .serena/
 .idea/
 .codegraph

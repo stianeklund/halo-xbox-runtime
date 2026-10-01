@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the linked APU adapter with simulated driver events, not APU emulation.
 
-python3 tools/test_audio_apu.py build-apu
+python3 tools/test_audio_apu.py build-seed
 Requires pefile and unicorn. The DPC pinning check runs the real driver DPC.
 """
 import math
@@ -801,7 +801,7 @@ def test_adapter_waits_for_stream_fifo_slot(build):
 
 
 if __name__ == "__main__":
-    build = Path(sys.argv[1] if len(sys.argv) > 1 else "build-apu")
+    build = Path(sys.argv[1] if len(sys.argv) > 1 else "build-seed")
     for test in (test_four_packets_and_coalesced_completion, test_contiguous_packets_play_in_place,
                  test_completion_before_next_process,
                  test_reference_voice_headroom, test_pause_gain_pitch_and_adpcm, test_stop_timeout_retains_ownership,

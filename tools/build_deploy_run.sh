@@ -14,7 +14,7 @@
 #                    (default: tools/deploy_init.txt, which enables
 #                    rasterizer_stats for the FPS display)
 #   --no-init        leave the title directory's init.txt untouched
-#   BUILD_ARGS       passed to build.sh (seed|apu|standalone|nogpu, --fresh,
+#   BUILD_ARGS       passed to build.sh (seed|standalone|nogpu, --fresh,
 #                    --inventory); -q/--quiet hides build output unless it fails
 #
 # The build's cachebeta.map is always uploaded next to the XBE: Halo's stack
@@ -95,18 +95,16 @@ filtered=()
 for arg in ${build_args[@]+"${build_args[@]}"}; do
   case "$arg" in
     -q|--quiet) quiet=1 ;;
-    seed|apu|standalone|nogpu) variant="$arg"; filtered+=("$arg") ;;
+    seed|standalone|nogpu) variant="$arg"; filtered+=("$arg") ;;
     *) filtered+=("$arg") ;;
   esac
 done
-title_name=standalone_seed.xbe
 case "$variant" in
   seed) xbe="$here/build-seed/default.xbe" ;;
-  apu) xbe="$here/build-apu/default.xbe"; title_name=standalone_apu.xbe ;;
   nogpu) xbe="$here/build-nogpu/default.xbe" ;;
   standalone) xbe="$here/build/default.xbe" ;;
 esac
-xbox_title="${XBOX_TITLE:-E:\\GAMES\\halo-patched\\$title_name}"
+xbox_title="${XBOX_TITLE:-E:\\GAMES\\halo-patched\\standalone_seed.xbe}"
 
 # Every XBDM call from WSL must re-exec through Windows (or run native when
 # HALO_NATIVE_XBDM=1 for a bridged guest).

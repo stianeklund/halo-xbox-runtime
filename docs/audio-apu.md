@@ -23,7 +23,7 @@ Keep the upstream checkout alongside the Halo checkouts:
 git clone https://github.com/Ryzee119/nxdk-audio /mnt/g/dev/nxdk-audio
 git -C /mnt/g/dev/nxdk-audio checkout fc2deca2cc1e434805ac03ca7c2f500b3b028f36
 cargo install dsp56300-asm --version 1.0.0 --locked --root "$PWD/build-audio-tools"
-./build.sh apu
+./build.sh
 ```
 
 The checkout must be at the pinned revision with the consumed files unmodified.
@@ -36,17 +36,16 @@ during CMake builds. Clang 18 is supported without `#embed`.
 Direct CMake selection:
 
 ```bash
-cmake -S . -B build-apu -DCMAKE_TOOLCHAIN_FILE=toolchains/llvm.cmake \
+cmake -S . -B build-seed -DCMAKE_TOOLCHAIN_FILE=toolchains/llvm.cmake \
   -DNXDK_DIR=/mnt/g/dev/nxdk -DHALO_ROOT=/mnt/g/dev/halo \
   -DHALO_STANDALONE_SEED_XBE=/mnt/g/dev/halo/halo-patched/cachebeta.xbe \
   -DHALO_STANDALONE_AUDIO=ON -DHALO_STANDALONE_AUDIO_BACKEND=apu
-cmake --build build-apu -j8
+cmake --build build-seed -j8
 ```
 
-`./build.sh apu --deploy` uploads `standalone_apu.xbe` by default. The `seed`
-variant uploads `standalone_seed.xbe` and also defaults to APU. To build the
-software fallback, use `HALO_STANDALONE_AUDIO_BACKEND=software ./build.sh seed`.
-Both variants use seeded legacy data and remain bring-up builds.
+`./build.sh --deploy` uploads `standalone_seed.xbe` by default. To build the
+software fallback, use `HALO_STANDALONE_AUDIO_BACKEND=software ./build.sh`.
+Both use seeded legacy data and remain bring-up builds.
 
 ## Ownership and completion
 
@@ -120,9 +119,9 @@ check that the TLS symbol retains its required value.
 ## Validation and next steps
 
 ```bash
-python3 tools/test_audio_apu.py build-apu
+python3 tools/test_audio_apu.py build-seed
 python3 tools/test_audio.py build-software
-python3 tools/audio_status.py build-apu/halo.map --host 127.0.0.1
+python3 tools/audio_status.py build-seed/halo.map --host 127.0.0.1
 ```
 
 The linked x86 tests simulate driver events and kernel boundaries. They check
@@ -169,7 +168,7 @@ After the TLS fix, xemu ran gameplay and reported 2,492 hardware buffers queued,
 2,406 completed, and zero driver errors, stop timeouts, or rejected packets in
 the first snapshot. This establishes startup and streaming progress in that
 isolated configuration, not success of the integrated networking build or
-reference audio fidelity. The normal `apu` variant uses the current worktree's
+reference audio fidelity. The normal build uses the current worktree's
 networking implementation.
 
 The user confirmed audible output but reported repeating fragments in dialogue,

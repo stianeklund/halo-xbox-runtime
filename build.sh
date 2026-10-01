@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Configure (if needed) and build the standalone XBE.
 #
-#   ./build.sh [seed|apu|standalone|nogpu] [--fresh] [--inventory] [--deploy]
+#   ./build.sh [seed|standalone|nogpu] [--fresh] [--inventory] [--deploy]
 #
 #   seed        (default) seeded APU bring-up build -> build-seed/default.xbe
-#   apu         seeded nxdk-audio prototype -> build-apu/default.xbe
 #   standalone  no seeded data (does not boot yet) -> build/default.xbe
 #   nogpu       seeded, HALO_STANDALONE_GPU_STATE=OFF -> build-nogpu/default.xbe
 #   --fresh     reconfigure from scratch (cmake --fresh)
@@ -29,11 +28,11 @@ JOBS="${JOBS:-$(nproc)}"
 variant=seed fresh=() inventory=0 deploy=0
 for arg in "$@"; do
 	case "$arg" in
-		seed|apu|standalone|nogpu) variant="$arg" ;;
+		seed|standalone|nogpu) variant="$arg" ;;
 		--fresh) fresh=(--fresh) ;;
 		--inventory) inventory=1 ;;
 		--deploy) deploy=1 ;;
-		-h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		-h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		*) echo "unknown argument: $arg" >&2; exit 2 ;;
 	esac
 done
@@ -50,15 +49,9 @@ case "$variant" in
 	seed)       build="$here/build-seed";  opts=(-DHALO_STANDALONE_SEED_XBE="$seed_xbe" -DHALO_STANDALONE_GPU_STATE=ON) ;;
 	nogpu)      build="$here/build-nogpu"; opts=(-DHALO_STANDALONE_SEED_XBE="$seed_xbe" -DHALO_STANDALONE_GPU_STATE=OFF) ;;
 	standalone) build="$here/build";       opts=(-DHALO_STANDALONE_SEED_XBE= -DHALO_STANDALONE_GPU_STATE=ON) ;;
-	apu)        build="$here/build-apu";   opts=(-DHALO_STANDALONE_SEED_XBE="$seed_xbe" -DHALO_STANDALONE_GPU_STATE=ON -DHALO_STANDALONE_AUDIO=ON) ;;
 esac
 audio_backend="${HALO_STANDALONE_AUDIO_BACKEND:-apu}"
-title_name=standalone_seed.xbe
-if [ "$variant" = apu ]; then
-	audio_backend=apu
-	title_name=standalone_apu.xbe
-fi
-XBOX_TITLE="${XBOX_TITLE:-E:\\GAMES\\halo-patched\\$title_name}"
+XBOX_TITLE="${XBOX_TITLE:-E:\\GAMES\\halo-patched\\standalone_seed.xbe}"
 
 echo "variant=$variant  NXDK_DIR=$NXDK_DIR  HALO_ROOT=$HALO_ROOT  seed=$seed_xbe"
 cmake -S "$here" -B "$build" "${fresh[@]}" \
