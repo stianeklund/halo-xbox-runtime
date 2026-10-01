@@ -8,7 +8,7 @@ import struct
 import sys
 from pathlib import Path
 
-from test_audio import (AudioImage, pcm, test_game_channel_reuse, test_game_channel_initialization,
+from test_audio import (HEADROOM, AudioImage, pcm, test_game_channel_reuse, test_game_channel_initialization,
                         test_spatial_gain)
 
 
@@ -209,8 +209,9 @@ def test_completion_before_next_process(build):
 
 def test_reference_voice_headroom(build):
     # Run the linked driver's gain conversion and inspect its real PIO writes.
-    # cachebeta 0x2054a8: 2D defaults to 600 mB; DS_CTRL3D defaults to zero.
-    for flags, headroom in ((0, 384), (0x10, 0)):
+    # cachebeta 0x2054a8: 2D defaults to 600 mB. DS_CTRL3D defaults to zero
+    # but loses the same on the HRTF path, which these voices stand in for.
+    for flags, headroom in ((0, 384), (0x10, 384)):
         image = ApuImage(build)
         desc = image.alloc(struct.pack("<6I", flags, 4, image.format(), image.callback, 42, 0))
         out = image.alloc(bytes(4))
@@ -281,9 +282,24 @@ def test_stop_timeout_retains_ownership(build):
 def test_stop_timeout_late_completion(build):
     image = ApuImage(build)
     stream = image.stream()
-    packets = [image.submit(stream, pcm(i), i) for i in range(4)]
-    hardware = image.hardware(stream)
+    old = [image.submit(stream, pcm(i), i) for i in range(4)]
+    spare = image.hardware(stream)
     image.stop_timeout = True
+    # Flush hands the stream to a second voice at once, as retail does. The
+    # stopping voice keeps its copies until the driver reports it idle.
+    assert image.method(stream, 6) == 0
+    assert image.sleeps == 0 and not image.freed
+    assert image.callbacks == [(42, i, 0x80004004) for i in range(4)]
+    assert all(image.words(status)[0] == 0x80004004 for _, _, status in old)
+    # Halo flushes twice per new sound; the voiceless second Flush must not wait.
+    assert image.method(stream, 6) == 0 and image.sleeps == 0
+    packets = [image.submit(stream, pcm(i), i) for i in range(4, 8)]
+    hardware = image.hardware(stream)
+    assert hardware != spare and not image.voices[spare]["destroyed"]
+    image.call("_standalone_audio_poll")
+    assert not image.voices[spare]["destroyed"]
+    # A second Flush before the first voice idles waits like Release.
+    image.callbacks.clear()
     assert image.method(stream, 6) == 0x80004005
     assert not image.voices[hardware]["destroyed"]
     assert not image.callbacks and not image.freed
@@ -292,13 +308,14 @@ def test_stop_timeout_late_completion(build):
     # The idle DPC can arrive after Flush timed out, leaving packets which
     # never reached either hardware slot. Halo waits on the active bit before
     # retrying Flush, so polling must retire those packets without callbacks.
+    image.write(spare, 3)
     image.write(hardware, 3)
     image.call("_standalone_audio_poll")
     assert image.words(stream + 0x30)[0] == 0, "late stop left stream active"
-    assert image.voices[hardware]["destroyed"]
+    assert image.voices[hardware]["destroyed"] and image.voices[spare]["destroyed"]
     assert not image.callbacks
     image.service()
-    assert image.callbacks == [(42, i, 0x80004004) for i in range(4)]
+    assert image.callbacks == [(42, i, 0x80004004) for i in range(4, 8)]
     assert all(image.words(status)[0] == 0x80004004 for _, _, status in packets)
     assert image.submit(stream, pcm(7), 7)[0] == 0
     image.complete(stream)
@@ -329,7 +346,7 @@ def test_halo_spatial_gain(build):
         voice = image.voices[image.hardware(stream)]
         image.complete(stream)
         image.service()
-        return tuple(round(g, 4) for g in voice["gain"])
+        return tuple(round(g * 32768 / int(32768 * HEADROOM), 4) for g in voice["gain"])
     image = None
 
     class Image(ApuImage):

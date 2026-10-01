@@ -191,7 +191,7 @@ static int __stdcall stream_flush(void *stream)
   struct sound_object *o = stream;
   int stopped;
   standalone_audio_lock();
-  stopped = audio_output_flush(&o->voice);
+  stopped = audio_output_flush_async(&o->voice);
   update_status(o);
   standalone_audio_unlock();
   /* Halo can reuse an idle channel immediately after Flush, resetting its
@@ -250,8 +250,9 @@ static int create_object(const struct audio_format *format, int is_stream,
   o->mix_bins = 3;
   o->is_3d = (flags & DS_CTRL3D) != 0;
   /* cachebeta's voice-settings constructor (0x2054a8) defaults to
-   * 600 mB headroom for 2D voices and zero for DS_CTRL3D voices. */
-  if (!o->is_3d) o->voice.gain_left = o->voice.gain_right = 16422;
+   * 600 mB headroom for 2D voices and zero for DS_CTRL3D voices; see
+   * apply_gain for the matching 3D path level. */
+  o->voice.gain_left = o->voice.gain_right = 16422;
   o->spatial.min_distance = 1.0f;
   o->spatial.max_distance = 1e9f;
   o->spatial.inside_angle = o->spatial.outside_angle = 360;
@@ -480,15 +481,18 @@ static int cone_level(const struct spatial *s, const double *to_listener)
  * low-frequency ratio; their high-frequency filtering is not modelled.
  * Panning approximates HRTF head shadow: the far ear keeps 30% at 90 deg.
  * Setters accept out-of-range values as the stubs did; this clamps them.
+ * 2D voices carry the reference 600 mB headroom. Retail plays DS_CTRL3D
+ * voices through the HRTF submixes instead, which these 2D voices bypass;
+ * recordings against cachebeta put that path 6 dB below the source, so 3D
+ * voices take the same 600 mB until they use hardware 3D voices.
  * Caller holds the audio lock. */
 static int apply_gain(struct sound_object *o)
 {
   const struct spatial *s = &o->spatial;
   float min_distance = s->min_distance > 0.0f ? s->min_distance : 0.0f;
-  double gain = level_gain(o->volume), left, right;
+  double gain = level_gain(o->volume) * level_gain(-600), left, right;
   double offset[3], distance, clamped, pan, right_axis[3], axis_length;
   int i;
-  if (!o->is_3d) gain *= level_gain(-600);
   left = o->mix_bins & 1 ? level_gain(o->bin_volume[0]) : 0.0;
   right = o->mix_bins & 2 ? level_gain(o->bin_volume[1]) : 0.0;
   if (o->is_3d) {
@@ -709,6 +713,17 @@ int __stdcall IDirectSound_SetRolloffFactor(void *ds, float rolloff, unsigned in
   standalone_audio_lock();
   listener_rolloff = rolloff >= 0.0f ? rolloff : 0.0f;
   return listener_changed(apply);
+}
+
+/* Halo clears the headroom of every bin but the last at startup. */
+int __stdcall IDirectSound_SetMixBinHeadroom(void *ds, unsigned int mix_bins, unsigned int headroom)
+{
+  int ok;
+  (void)ds;
+  standalone_audio_lock();
+  ok = audio_output_mixbin_headroom(mix_bins, headroom);
+  standalone_audio_unlock();
+  return ok ? DS_OK : DS_FAILED;
 }
 
 int __stdcall IDirectSound_CommitDeferredSettings(void *ds)

@@ -179,9 +179,12 @@ def pcm(*samples):
     return struct.pack("<" + "h" * len(samples), *samples)
 
 
+# Reference DirectSound headroom; 3D voices take the same until they use the HRTF path.
+HEADROOM = 10 ** (-6 / 20)
+
+
 def output_samples(samples):
-    # Reference DirectSound headroom for ordinary 2D voices.
-    gain = int(32768 * 10 ** (-6 / 20))
+    gain = int(32768 * HEADROOM)
     return tuple(max(-32768, min(32767, int(sample * gain / 32768)))
                  for sample in samples)
 
@@ -460,10 +463,10 @@ def test_game_channel_initialization(build, image_type=AudioImage, playback=None
             result = image.submit(stream, payload, index)[0]
             assert result == 0, (flags, fmt, hex(result))
             if playback:
-                playback(image, stream, payload, gain * bins * (1.0 if flags & 1 else 10 ** (-6 / 20)))
+                playback(image, stream, payload, gain * bins * HEADROOM)
             else:
                 expected = ((250, 250) if bins < 1 else (500, 500)) if gain else (0, 0)
-                assert image.render(1) == (expected if flags & 1 else output_samples(expected))
+                assert image.render(1) == output_samples(expected)
             assert image.method(stream, 6) == 0
         image.release(stream)
 
@@ -475,7 +478,7 @@ def test_spatial_gain(build, image_type=AudioImage, gains=None):
             image.submit(stream, pcm(10000))
             left, right = image.render(1)
             image.service()
-            scale = 10000  # 3D voices have no default headroom.
+            scale = output_samples((10000,))[0]
             return left / scale, right / scale
     desc = image.alloc(struct.pack("<IIIIII", 0x10, 4, image.format(), image.callback, 42, 0))
     out = image.alloc(bytes(4))
@@ -554,7 +557,7 @@ def test_game_channel_packets(build):
     assert image.call("_dsound_channel_queue_packet", 7) & 255 == 0
     assert cache_refs == [permutation, permutation]
     output = image.render(300)
-    assert output[:4] == (500, 500, 500, 500)  # Type 9 is 3D.
+    assert output[:4] == output_samples((500,) * 4)
     assert output[-2:] == (0, 0)
     image.service()
     assert image.callbacks == [(7, permutation, 0), (7, permutation, 0)]

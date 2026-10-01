@@ -15,6 +15,9 @@ struct apu_voice {
     unsigned int capacity[AUDIO_PACKET_COUNT];
     int owners[2]; /* hardware SSL slot -> Halo packet slot */
     struct audio_voice *voice;
+    /* A stream's other hardware voice. After an async flush it is the voice
+     * still stopping, which keeps its copies until the driver reports idle. */
+    struct apu_voice *spare;
     unsigned int frequency;
     int stream, valid, stopping, buffer_attached;
 };
@@ -130,14 +133,11 @@ int audio_output_create(struct audio_voice *v, int stream)
     return 1;
 }
 
-static int stop_voice(struct apu_voice *h)
+/* The driver marks STOPPED only after its DPC unlinks the idle voice.
+ * Keep cache/staging ownership until that handshake finishes. */
+static int wait_stopped(struct apu_voice *h)
 {
     unsigned int attempts;
-    if (!h->valid) return 1;
-    h->stopping = 1;
-    if (!nxAudioVoiceStop(&h->hardware)) return failed();
-    /* The driver marks STOPPED only after its DPC unlinks the idle voice.
-     * Keep cache/staging ownership until that handshake finishes. */
     for (attempts = 0; attempts < 150; attempts++) {
         if (nxAudioVoiceGetState(&h->hardware) == NX_STOPPED) return 1;
         Sleep(1);
@@ -145,6 +145,26 @@ static int stop_voice(struct apu_voice *h)
     halo_audio_apu_stats[6]++;
     DbgPrint("[audio] APU stop timed out; retaining DMA buffers\n");
     return 0;
+}
+
+static int stop_voice(struct apu_voice *h)
+{
+    if (!h->valid) return 1;
+    h->stopping = 1;
+    if (!nxAudioVoiceStop(&h->hardware)) return failed();
+    return wait_stopped(h);
+}
+
+/* Destroy a voice that an async flush left stopping, once it is idle. */
+static int reap_spare(struct apu_voice *h, int wait)
+{
+    struct apu_voice *s = h->spare;
+    if (!s || !s->valid) return 1;
+    if (wait ? !wait_stopped(s) : nxAudioVoiceGetState(&s->hardware) != NX_STOPPED) return 0;
+    nxAudioVoiceDestroy(&s->hardware);
+    halo_audio_apu_stats[2]++;
+    s->valid = 0;
+    return 1;
 }
 
 static void finish_flush(struct audio_voice *v)
@@ -164,8 +184,45 @@ static void finish_flush(struct audio_voice *v)
 
 int audio_output_flush(struct audio_voice *v)
 {
-    if (!stop_voice(v->backend)) return 0;
+    struct apu_voice *h = v->backend;
+    if (!stop_voice(h) || !reap_spare(h, 1)) return 0;
     finish_flush(v);
+    return 1;
+}
+
+/* Retail DirectSound cuts a flushed stream and starts its next packet on
+ * another hardware voice in the same frame. Waiting here for the stop
+ * handshake left an audible gap between consecutive weapon shots. Hand the
+ * stream to its spare voice instead, and let the poll reap the old one. */
+int audio_output_flush_async(struct audio_voice *v)
+{
+    struct apu_voice *h = v->backend, *s;
+    /* Halo flushes a channel twice per new sound. The second finds no
+     * voice, and must not wait for the first to retire. */
+    if (h->stream && !h->valid) {
+        finish_flush(v);
+        return 1;
+    }
+    if (!h->stream || h->stopping || !reap_spare(h, 0))
+        return audio_output_flush(v);
+    if (!h->spare) {
+        if (!(s = calloc(1, sizeof(*s)))) return audio_output_flush(v);
+        s->voice = v;
+        s->stream = 1;
+        h->spare = s;
+        s->spare = h;
+    }
+    s = h->spare;
+    h->stopping = 1;
+    if (!nxAudioVoiceStop(&h->hardware)) return failed();
+    if (nxAudioVoiceGetState(&h->hardware) == NX_STOPPED) {
+        finish_flush(v);
+        return 1;
+    }
+    h->owners[0] = h->owners[1] = -1;
+    s->frequency = h->frequency;
+    v->backend = s;
+    audio_voice_flush(v);
     return 1;
 }
 
@@ -177,16 +234,22 @@ int audio_output_ready(const struct audio_voice *v)
 
 void audio_output_destroy(struct audio_voice *v)
 {
-    struct apu_voice *h = v->backend;
-    unsigned int i;
+    struct apu_voice *h = v->backend, *voices[2];
+    unsigned int i, j;
     if (!h) return;
-    if (h->valid) {
-        nxAudioVoiceDestroy(&h->hardware);
-        halo_audio_apu_stats[2]++;
+    /* Release flushed synchronously, so the spare voice has stopped too. */
+    voices[0] = h;
+    voices[1] = h->spare;
+    for (j = 0; j < 2; j++) {
+        if (!(h = voices[j])) continue;
+        if (h->valid) {
+            nxAudioVoiceDestroy(&h->hardware);
+            halo_audio_apu_stats[2]++;
+        }
+        for (i = 0; i < AUDIO_PACKET_COUNT; i++)
+            if (h->copies[i]) MmFreeContiguousMemory(h->copies[i]);
+        free(h);
     }
-    for (i = 0; i < AUDIO_PACKET_COUNT; i++)
-        if (h->copies[i]) MmFreeContiguousMemory(h->copies[i]);
-    free(h);
     v->backend = NULL;
 }
 
@@ -269,7 +332,9 @@ int audio_output_submit(struct audio_voice *v, const struct audio_packet *p)
 void audio_output_poll(struct audio_voice *v)
 {
     struct apu_voice *h = v->backend;
-    if (!h || !h->valid) return;
+    if (!h) return;
+    reap_spare(h, 0);
+    if (!h->valid) return;
     /* Flush can time out before the idle DPC finishes. Halo waits for the
      * active bit to clear before retrying Flush. Retire every remaining
      * packet once DMA ownership ends, including packets never queued to
@@ -289,6 +354,26 @@ int audio_output_volume(struct audio_voice *v)
 {
     struct apu_voice *h = v->backend;
     return !h->valid || set_gain(h) || failed();
+}
+
+/* nxdk-audio starts, like retail DirectSound, with submix headroom 1 on
+ * bins 0-30; Halo's SetMixBinHeadroom(0x7fffffff, 0) clears it. Each step
+ * halves a bin's input in the VP. Not voice-indexed, but keep the PIO
+ * sequence whole relative to the completion DPC's own writes. */
+int audio_output_mixbin_headroom(unsigned int mix_bins, unsigned int headroom)
+{
+    unsigned int bin;
+    KIRQL irql;
+    if (!initialized) return 0;
+    irql = KeRaiseIrqlToDpcLevel();
+    for (bin = 0; bin < 32; bin++) {
+        if (!(mix_bins & (1u << bin))) continue;
+        apu_wait_for_pio(1);
+        apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_SUBMIX_HEADROOM + bin * 4,
+                      headroom & NV1BA0_PIO_SET_SUBMIX_HEADROOM_AMOUNT);
+    }
+    KfLowerIrql(irql);
+    return 1;
 }
 
 int audio_output_frequency(struct audio_voice *v, unsigned int frequency)
