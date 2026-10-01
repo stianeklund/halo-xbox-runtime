@@ -28,7 +28,7 @@ set(USB_DIR "${NXDK_DIR}/lib/usb")
 set(USB_HID_SOURCES
 	"${USB_DIR}/libusbohci/src_hid/hid_core.c"
 	"${USB_DIR}/libusbohci/src_hid/hid_driver.c")
-target_sources(standalone_crt PRIVATE nxdk_keyboard.c ${USB_HID_SOURCES})
+target_sources(standalone_crt PRIVATE nxdk_keyboard.c nxdk_usb.c ${USB_HID_SOURCES})
 set_property(SOURCE nxdk_keyboard.c ${USB_HID_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
 	"-I${USB_DIR}/libusbohci/inc" "-I${USB_DIR}/libusbohci_xbox"
 	"-DUSBH_USE_EXTERNAL_CONFIG=\"usbh_config_xbox.h\""
@@ -38,7 +38,7 @@ set_target_properties(standalone_crt PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
 # sources, and pdclib_open.c (which includes nxdk's _PDCLIB_open.c), are
 # compiled as they come.
 set(CRT_OWN_SOURCES msvc_print.c nxdk_net.c nxdk_debug_net.c nxdk_xnet.c
-	../compat/xnet/xnet.c ../compat/xnet/security.c nxdk_keyboard.c
+	../compat/xnet/xnet.c ../compat/xnet/security.c nxdk_keyboard.c nxdk_usb.c
 	../compat/audio/mixer.c nxdk_audio_apu.c nxdk_audio.c)
 set_property(SOURCE ${CRT_OWN_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -Wall -Werror)
 target_include_directories(standalone_crt BEFORE PRIVATE

@@ -7,7 +7,9 @@
  * next to this file.
  *
  * Interrupt-in completions run from the OHCI interrupt and only append
- * reports to a single-producer ring; the game thread diffs them. */
+ * reports to a single-producer ring; the game thread diffs them. They never
+ * resubmit (see crt/nxdk_usb.c): every function here except the completion
+ * runs with the USB lock held. */
 #include <windows.h>
 #include <string.h>
 #include "usbh_lib.h"
@@ -21,6 +23,12 @@ static uint8_t last_report[REPORT_BYTES];
 static volatile unsigned int report_head, report_tail;
 static HID_DEV_T *keyboard;
 static uint32_t keyboard_uid;
+/* The keyboard's interrupt-in read, listed in keyboard->utr_list so
+ * hid_disconnect quits and frees it. */
+static UTR_T *keyboard_utr;
+static volatile uint8_t keyboard_rearm;
+
+void standalone_usb_signal(void);
 
 /* hid_core.c / hid_driver.c log through sysprintf; keep them quiet. */
 void standalone_hid_log(const char *format, ...)
@@ -49,12 +57,78 @@ void standalone_keyboard_push(const uint8_t *report)
     report_head = head + 1;
 }
 
-static void report_received(HID_DEV_T *hdev, uint16_t ep_addr, int status,
-                            uint8_t *data, uint32_t length)
+/* nxdk's usbh_hid_start_int_read resubmits from this completion, in the
+ * OHCI interrupt, so the read is ours and the USB worker re-arms it. */
+static void report_received(UTR_T *utr)
 {
-    (void)ep_addr;
-    if (hdev == keyboard && status == 0 && length >= REPORT_BYTES)
-        standalone_keyboard_push(data);
+    if (utr != keyboard_utr || utr->status != 0)
+        return;
+    if (utr->xfer_len >= REPORT_BYTES)
+        standalone_keyboard_push(utr->buff);
+    keyboard_rearm = 1;
+    standalone_usb_signal();
+}
+
+/* hid_disconnect frees keyboard_utr; a hub poll may have run it since the
+ * last refresh. */
+static int keyboard_attached(void)
+{
+    HID_DEV_T *hdev;
+
+    for (hdev = usbh_hid_get_device_list(); hdev != NULL; hdev = hdev->next) {
+        if (hdev == keyboard && hdev->uid == keyboard_uid)
+            return 1;
+    }
+    return 0;
+}
+
+/* Submits the read, or resubmits it once the last one has finished. */
+static void keyboard_arm(void)
+{
+    IFACE_T *iface = (IFACE_T *)keyboard->iface;
+    EP_INFO_T *ep;
+    UTR_T *utr;
+    int slot;
+
+    keyboard_rearm = 0;
+    if (keyboard_utr != NULL) {
+        if (!keyboard_utr->bIsTransferDone)
+            return;
+        keyboard_utr->bIsTransferDone = 0;
+        keyboard_utr->xfer_len = 0;
+        if (usbh_int_xfer(keyboard_utr) != USBH_OK)
+            keyboard_utr->bIsTransferDone = 1;
+        return;
+    }
+    if (iface == NULL || iface->udev == NULL)
+        return;
+    ep = usbh_iface_find_ep(iface, 0, EP_ADDR_DIR_IN | EP_ATTR_TT_INT);
+    if (ep == NULL)
+        return;
+    for (slot = 0; slot < CONFIG_HID_DEV_MAX_PIPE && keyboard->utr_list[slot] != NULL; slot++)
+        ;
+    if (slot == CONFIG_HID_DEV_MAX_PIPE)
+        return;
+    utr = alloc_utr(iface->udev);
+    if (utr == NULL)
+        return;
+    utr->buff = usbh_alloc_mem(ep->wMaxPacketSize);
+    if (utr->buff == NULL) {
+        free_utr(utr);
+        return;
+    }
+    utr->context = keyboard;
+    utr->ep = ep;
+    utr->data_len = ep->wMaxPacketSize;
+    utr->func = report_received;
+    keyboard_utr = utr;
+    if (usbh_int_xfer(utr) != USBH_OK) {
+        keyboard_utr = NULL;
+        usbh_free_mem(utr->buff, ep->wMaxPacketSize);
+        free_utr(utr);
+        return;
+    }
+    keyboard->utr_list[slot] = utr;
 }
 
 /* Registers the class driver. Call after usbh_core_init and before the first
@@ -65,7 +139,8 @@ void standalone_keyboard_usb_init(void)
 }
 
 /* Returns 1 while a boot keyboard is attached. Starts reading a newly attached
- * one; the caller has already polled the hubs this frame. */
+ * one, and retries a read that failed; the caller has already polled the hubs
+ * this frame. */
 int standalone_keyboard_usb_refresh(void)
 {
     HID_DEV_T *hdev;
@@ -76,20 +151,28 @@ int standalone_keyboard_usb_refresh(void)
     }
     if (hdev == NULL) {
         keyboard = NULL;
+        keyboard_utr = NULL;
         return 0;
     }
     if (hdev != keyboard || hdev->uid != keyboard_uid) {
         keyboard = hdev;
         keyboard_uid = hdev->uid;
+        keyboard_utr = NULL;
         report_tail = report_head;
         /* Boot protocol fixes the report at modifiers, reserved, 6 usages;
          * idle 0 reports only on change. */
         usbh_hid_set_protocol(hdev, 0);
         usbh_hid_set_idle(hdev, 0, 0);
     }
-    /* Returns HID_RET_XFER_IS_RUNNING while the read is armed. */
-    usbh_hid_start_int_read(hdev, 0, report_received);
+    keyboard_arm();
     return 1;
+}
+
+/* Called by the USB worker after a completed read. */
+void standalone_keyboard_usb_service(void)
+{
+    if (keyboard_rearm && keyboard != NULL && keyboard_attached())
+        keyboard_arm();
 }
 
 /* Pops the oldest report into `report`; returns 0 when none is pending. */

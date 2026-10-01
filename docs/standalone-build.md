@@ -173,7 +173,7 @@ Compat files:
 | `compat/xapi/xvutil.c` | `GetFileAttributesA` (kb `file_get_full_attributes`), `GlobalMemoryStatus`, `Sleep`, `SetFileAttributesA`, `RemoveDirectoryA`, `XQueryValue`, the `LocalAlloc` twin at 0x1d0bb9 and `XapiSetLastNTError`. A 0-returning stub is wrong for most of these: GetFileAttributesA returning 0 means "file exists". |
 | `compat/xapi/heap.c` | `LocalAlloc`/`LocalFree`/`LocalReAlloc`/`LocalSize` (kb `FUN_001d0c48`/`c16`/`c65`/`c02`) on the pdclib heap |
 | `compat/xapi/launch.c` | `XGetLaunchInfo` |
-| `compat/xapi/input.c` | XAPI controller input on nxdk's USB/XID host driver. |
+| `compat/xapi/input.c`, `crt/nxdk_usb.c`, `crt/nxdk_keyboard.c` | XAPI controller input on nxdk's USB/XID host driver. `XInputSetState` is asynchronous like the original (0x24c427): it returns `ERROR_IO_PENDING`, and the completion writes `dwStatus` and signals `hEvent`. nxdk allocates transfer descriptors without masking its interrupt, so USB completions never resubmit. They signal a worker thread that re-arms reads and finishes output requests under the USB lock that every thread-side caller holds. A resubmitting completion can share a TD with a rumble write, and xemu then aborts in `usb_packet_copy`. |
 | `compat/xapi/keyboard.c` | The debug keyboard queue: `XInputDebugInitKeyboardQueue` (0x252d73) and `XInputDebugGetKeystroke` (0x252ad9). An empty queue returns `ERROR_HANDLE_EOF` (0x26) as the original does; a 0 stub means "key available" and `input_update_keyboard_devices` spins forever. |
 | `compat/xapi/savegame.c` | XAPILIB saved-game and directory-enumeration routines. |
 | `compat/xapi/nickname.c` | Nicknames (0x1d26f3 set, 0x1d29eb find first) in `NICKNAME.XBN`. |
