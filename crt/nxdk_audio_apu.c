@@ -7,6 +7,7 @@
 #include <string.h>
 #include "audio_internal.h"
 #include "../compat/audio/backend.h"
+#include "xdk_hrtf.h"
 
 struct apu_voice {
     nxAudioVoice hardware;
@@ -20,6 +21,11 @@ struct apu_voice {
     struct apu_voice *spare;
     unsigned int frequency;
     int stream, valid, stopping, buffer_attached;
+    /* A mono DS_CTRL3D voice on a hardware 3D voice: its HRTF entry
+     * double-buffer toggle and the last pair and Doppler ratio applied. */
+    int spatial, toggle, hrtf_valid;
+    nxAudioHRTFParams hrtf;
+    float doppler;
 };
 
 static CRITICAL_SECTION audio_lock;
@@ -94,6 +100,133 @@ static int set_gain(struct apu_voice *h)
                                       (float)h->voice->gain_right / 32768.0f, 0.0f, 0.0f, 0.0f, 0.0f);
 }
 
+/* The frequency the game set, scaled by a 3D voice's Doppler ratio, within
+ * DirectSound's pitch range (DSBFREQUENCY_MIN..MAX). */
+static int set_pitch(struct apu_voice *h)
+{
+    float rate = (float)h->frequency * (h->spatial ? h->voice->doppler : 1.0f);
+    rate = rate < 188.0f ? 188.0f : rate > 191999.0f ? 191999.0f : rate;
+    h->doppler = h->voice->doppler;
+    return nxAudioVoiceSetPitch(&h->hardware, rate / (float)h->voice->format.rate);
+}
+
+/* FUN_00207cc8: fistp(x - 0.5) under round-to-nearest, plus one if negative. */
+static int xdk_ftol(float x)
+{
+    int i;
+    x -= 0.5f;
+    __asm__("fistpl %0" : "=m"(i) : "t"(x) : "st");
+    return i < 0 ? i + 1 : i;
+}
+
+/* CSensaura3d_GetFullHRTFFilterPair (cachebeta 0x20a2f5) quantizes the
+ * pseudo-angles to the filter grid. The rear fold applies only to surround
+ * output, so it is omitted. Left of centre swaps the ears and negates ITD. */
+static void hrtf_pair(float azimuth, float elevation, nxAudioHRTFParams *p)
+{
+    float magnitude = azimuth < 0.0f ? -azimuth : azimuth;
+    int el = xdk_ftol(elevation < 0.0f ? elevation - 3.0f : elevation + 3.0f) / 6 * 6, az = 0, i;
+    const unsigned char *left, *right;
+    if (el < -90 || el > 90) el = 0;
+    if (el != 90 && el != -90) {
+        if (el > 60 || el < -60) az = xdk_ftol(magnitude + 6.0f) / 12 * 12;
+        else if (el > 30 || el < -30) az = xdk_ftol(magnitude + 3.0f) / 6 * 6;
+        else az = xdk_ftol(magnitude + 1.5f) / 3 * 3;
+        if (az < 0 || az > 180) az = 0;
+    }
+    left = xdk_hrtf_filters[xdk_hrtf_index[az / 3][(el + 90) / 6]];
+    right = left + 32;
+    p->itd = left[31];
+    if (azimuth < 0.0f) {
+        right = left;
+        left = right + 32;
+        p->itd = (int16_t)-p->itd;
+    }
+    for (i = 0; i < 31; i++) {
+        p->hrir_left[i] = (int8_t)left[i];
+        p->hrir_right[i] = (int8_t)right[i];
+    }
+}
+
+/* Retail writes each new pair to the voice's other HRTF entry (2v or
+ * 2v + 1), then retargets the voice, so the VP never reads an entry
+ * mid-update. An unchanged pair is not rewritten. */
+static int set_hrtf(struct apu_voice *h)
+{
+    nxAudioHRTFParams p;
+    unsigned int entry;
+    KIRQL irql;
+    hrtf_pair(h->voice->azimuth, h->voice->elevation, &p);
+    if (h->hrtf_valid && !memcmp(&p, &h->hrtf, sizeof(p))) return 1;
+    entry = h->hardware.voice_index * 2u + (unsigned int)h->toggle;
+    irql = KeRaiseIrqlToDpcLevel();
+    nxAudioHRTFSetParameters((uint8_t)entry, &p);
+    KfLowerIrql(irql);
+    if (!nxAudioVoiceSetHRTFTarget(&h->hardware, (uint16_t)entry)) return failed();
+    h->toggle ^= 1;
+    h->hrtf = p;
+    h->hrtf_valid = 1;
+    return 1;
+}
+
+static uint32_t attenuation(int level)
+{
+    uint32_t units = level < 0 ? ((uint32_t)-level << 6) / 100 : 0;
+    return units > 0xfff ? 0xfff : units;
+}
+
+/* Retail's register image (FUN_00208000, CMcpxVoiceClient_SetFilter):
+ * slots 0-4 carry the mB levels for bins 6-10, slots 5-7 are muted, and
+ * the I3DL2 filter mode takes TAR_FCB. nxdk-audio's shadows stay current
+ * for its own later writes. */
+static int set_spatial(struct apu_voice *h)
+{
+    nxAudioVoice *hw = &h->hardware;
+    const int *level = h->voice->level;
+    uint32_t a[8], vola, volb, volc, misc;
+    unsigned int i;
+    KIRQL irql;
+    for (i = 0; i < 8; i++) a[i] = i < 5 ? attenuation(level[i]) : 0xfff;
+    vola = APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_VOLA_VOLUME0, a[0]) | APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_VOLA_VOLUME1, a[1]) |
+           APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_VOLA_VOLUME6_B3_0, a[6]) |
+           APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_VOLA_VOLUME7_B3_0, a[7]);
+    volb = APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_VOLB_VOLUME2, a[2]) | APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_VOLB_VOLUME3, a[3]) |
+           APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_VOLB_VOLUME6_B7_4, a[6] >> 4) |
+           APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_VOLB_VOLUME7_B7_4, a[7] >> 4);
+    volc = APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_VOLC_VOLUME4, a[4]) | APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_VOLC_VOLUME5, a[5]) |
+           APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_VOLC_VOLUME6_B11_8, a[6] >> 8) |
+           APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_VOLC_VOLUME7_B11_8, a[7] >> 8);
+    misc = (hw->cfg_misc & ~(uint32_t)NV_PAVS_VOICE_CFG_MISC_FMODE) |
+           APU_MAKE_VALUE(NV_PAVS_VOICE_CFG_MISC_FMODE, NX_FILTER_MODE_3D_I3DL2_REVERB);
+    if (vola == hw->tar_vola && volb == hw->tar_volb && volc == hw->tar_volc && misc == hw->cfg_misc &&
+        h->voice->filter == hw->tar_fcb)
+        return 1;
+    hw->tar_vola = vola;
+    hw->tar_volb = volb;
+    hw->tar_volc = volc;
+    hw->cfg_misc = misc;
+    hw->tar_fcb = h->voice->filter;
+    irql = KeRaiseIrqlToDpcLevel();
+    apu_wait_for_pio(9);
+    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, hw->voice_index);
+    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
+    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLA, vola);
+    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLB, volb);
+    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLC, volc);
+    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_MISC, misc);
+    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_FCA, hw->tar_fca);
+    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_FCB, hw->tar_fcb);
+    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
+    KfLowerIrql(irql);
+    return 1;
+}
+
+static int set_output(struct apu_voice *h)
+{
+    if (!h->spatial) return set_gain(h);
+    return set_hrtf(h) && set_spatial(h) && (h->doppler == h->voice->doppler || set_pitch(h));
+}
+
 static int make_voice(struct apu_voice *h)
 {
     const struct audio_format *f = &h->voice->format;
@@ -102,17 +235,24 @@ static int make_voice(struct apu_voice *h)
     format.channels = (uint8_t)f->channels;
     format.bytes_per_sample = (uint8_t)(f->bits / 8);
     format.codec = f->tag == 0x69 ? NX_AUDIO_CODEC_ADPCM : NX_AUDIO_CODEC_PCM;
-    /* Spatial calculation is a subsequent milestone. This first backend
-     * uses the driver's 192 2D voice slots and keeps existing stereo routing. */
-    format.type = h->stream ? NX_VOICE_TYPE_2D_STREAM : NX_VOICE_TYPE_2D_STATIC;
-    if (!nxAudioVoiceCreate(&h->hardware, &format)) return failed();
+    /* Retail plays a mono DS_CTRL3D voice on one of the 64 3D voices. When
+     * those run out, the 2D voice takes the adapter's stereo approximation. */
+    h->spatial = h->voice->is_3d && f->channels == 1;
+    format.type = h->spatial ? (h->stream ? NX_VOICE_TYPE_3D_STREAM : NX_VOICE_TYPE_3D_STATIC)
+                             : (h->stream ? NX_VOICE_TYPE_2D_STREAM : NX_VOICE_TYPE_2D_STATIC);
+    if (!nxAudioVoiceCreate(&h->hardware, &format)) {
+        if (!h->spatial) return failed();
+        h->spatial = 0;
+        format.type = h->stream ? NX_VOICE_TYPE_2D_STREAM : NX_VOICE_TYPE_2D_STATIC;
+        if (!nxAudioVoiceCreate(&h->hardware, &format)) return failed();
+    }
     h->valid = 1;
     h->stopping = h->buffer_attached = 0;
     h->owners[0] = h->owners[1] = -1;
+    h->toggle = h->hrtf_valid = 0;
     halo_audio_apu_stats[1]++;
     nxAudioBufferSetCallback(&h->hardware, buffer_consumed, h);
-    if (!set_gain(h) ||
-        !nxAudioVoiceSetPitch(&h->hardware, (float)h->frequency / (float)f->rate)) {
+    if (!set_pitch(h) || !set_output(h)) {
         nxAudioVoiceDestroy(&h->hardware);
         h->valid = 0;
         halo_audio_apu_stats[2]++;
@@ -353,7 +493,7 @@ void audio_output_poll(struct audio_voice *v)
 int audio_output_volume(struct audio_voice *v)
 {
     struct apu_voice *h = v->backend;
-    return !h->valid || set_gain(h) || failed();
+    return !h->valid || set_output(h) || failed();
 }
 
 /* nxdk-audio starts, like retail DirectSound, with submix headroom 1 on
@@ -380,7 +520,7 @@ int audio_output_frequency(struct audio_voice *v, unsigned int frequency)
 {
     struct apu_voice *h = v->backend;
     h->frequency = frequency;
-    return !h->valid || nxAudioVoiceSetPitch(&h->hardware, (float)frequency / (float)v->format.rate) || failed();
+    return !h->valid || set_pitch(h) || failed();
 }
 
 int audio_output_pause(struct audio_voice *v, int pause)

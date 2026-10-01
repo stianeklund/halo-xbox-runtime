@@ -390,3 +390,33 @@
      uint32_t cfg_vbin;
      uint32_t cfg_fmt;
      uint32_t cfg_env0;
+--- a/passthrough.a56
++++ b/passthrough.a56
+@@ -104,7 +104,10 @@
+         jclr #DSP_IRQ_START_FRAME_BIT, x:DSP_IRQ_STATUS, _wait_for_frame
+         movep #DSP_IRQ_START_FRAME_MASK, x:DSP_IRQ_STATUS
+ 
+-    ; Mix HRTF bins (6, 8 -> 0) and (7, 9 -> 1)
++    ; Mix HRTF bins (6, 8 -> 0) and (7, 9 -> 1) at +6 dB. Halo's DSP image,
++    ; which this program stands in for, plays them louder than a plain sum:
++    ; xemu recordings put cachebeta's 3D voices 6 dB below their front level,
++    ; but xemu's normalized HRTF stage alone removes about 12 dB.
+     move #MIXBIN_FRONT_LEFT, r0
+     move #MIXBIN_HRTF_6, r1
+     move #MIXBIN_HRTF_8, r2
+@@ -112,6 +115,7 @@
+         move x:(r1)+, a
+         move x:(r2)+, b
+         add b, a
++        asl a
+         move x:(r0), b
+         add b, a
+         move a, x:(r0)+
+@@ -124,6 +128,7 @@
+         move x:(r1)+, a
+         move x:(r2)+, b
+         add b, a
++        asl a
+         move x:(r0), b
+         add b, a
+         move a, x:(r0)+

@@ -4,12 +4,13 @@
 python3 tools/test_audio_apu.py build-apu
 Requires pefile and unicorn. The DPC pinning check runs the real driver DPC.
 """
+import math
+import re
 import struct
 import sys
 from pathlib import Path
 
-from test_audio import (HEADROOM, AudioImage, pcm, test_game_channel_reuse, test_game_channel_initialization,
-                        test_spatial_gain)
+from test_audio import (HEADROOM, AudioImage, floats, pcm, test_game_channel_reuse, test_game_channel_initialization)
 
 
 class ApuImage(AudioImage):
@@ -62,7 +63,8 @@ class ApuImage(AudioImage):
 
     def create_voice(self):
         voice, format_address = self.args(2)
-        self.voices[voice] = {"destroyed": False, "queues": [], "gain": (1.0, 1.0), "pitch": 1.0}
+        self.voices[voice] = {"destroyed": False, "queues": [], "gain": (1.0, 1.0), "pitch": 1.0,
+                              "type": self.words(format_address + 12)[0]}
         self.write(voice, 3)  # NX_STOPPED
         self.uc.mem_write(voice + 4, bytes(self.uc.mem_read(format_address, 16)))
         self.write(voice + 20, 0, 0)
@@ -208,10 +210,10 @@ def test_completion_before_next_process(build):
 
 
 def test_reference_voice_headroom(build):
-    # Run the linked driver's gain conversion and inspect its real PIO writes.
-    # cachebeta 0x2054a8: 2D defaults to 600 mB. DS_CTRL3D defaults to zero
-    # but loses the same on the HRTF path, which these voices stand in for.
-    for flags, headroom in ((0, 384), (0x10, 384)):
+    # Inspect the real PIO writes for slots 0 and 1. cachebeta 0x2054a8: 2D
+    # defaults to 600 mB through the linked driver's gain conversion. A
+    # DS_CTRL3D voice has none; its slot 1 is a rear bin, muted for stereo.
+    for flags, headroom, rear in ((0, 384, 384), (0x10, 0, 0xfff)):
         image = ApuImage(build)
         desc = image.alloc(struct.pack("<6I", flags, 4, image.format(), image.callback, 42, 0))
         out = image.alloc(bytes(4))
@@ -229,9 +231,11 @@ def test_reference_voice_headroom(build):
             register = image.words(0xfe820360)[0]
             return (register >> 4) & 0xfff, (register >> 20) & 0xfff
 
-        assert all(abs(value - headroom) <= 1 for value in levels()), levels()
+        front, back = levels()
+        assert abs(front - headroom) <= 1 and abs(back - rear) <= 1, levels()
         assert image.call("_IDirectSoundStream_SetVolume@8", stream, -600) == 0
-        assert all(abs(value - (headroom + 384)) <= 1 for value in levels()), levels()
+        front, back = levels()
+        assert abs(front - headroom - 384) <= 1 and abs(back - min(rear + 384, 0xfff)) <= 1, levels()
         assert image.call("_IDirectSoundStream_SetVolume@8", stream, -10000) == 0
         assert levels() == (0xfff, 0xfff)
         image.complete(stream)
@@ -335,26 +339,82 @@ def test_halo_channel_reuse(build):
 def test_halo_channel_initialization(build):
     def playback(image, stream, payload, gain):
         voice = image.voices[image.hardware(stream)]
-        assert all(abs(g - gain) < 0.001 for g in voice["gain"]), (voice["gain"], gain)
+        if voice["type"] == 3:
+            # A 3D channel's front slot, without the 2D headroom.
+            front = image.words(0xfe820360)[0] >> 4 & 0xfff
+            assert front == (0 if gain else 0xfff), (hex(front), gain)
+        else:
+            assert all(abs(g - gain) < 0.001 for g in voice["gain"]), (voice["gain"], gain)
         assert voice["queues"] == [payload]
     test_game_channel_initialization(build, ApuImage, playback)
 
 
-def test_halo_spatial_gain(build):
-    def gains(image, stream):
+def hrtf_tables(build):
+    text = (Path(build) / "generated" / "xdk_hrtf.h").read_text()
+    rows = [[int(v) for v in row.split(",")] for row in re.findall(r"^\{([-\d,]+)\},$", text, re.M)]
+    return rows[:-61], rows[-61:]
+
+
+def hrir_words(left, right, itd):
+    words = [left[2 * i] | right[2 * i] << 8 | left[2 * i + 1] << 16 | right[2 * i + 1] << 24 for i in range(15)]
+    return words + [(left[30] | right[30] << 8 | itd << 25) & 0xffffffff]
+
+
+def test_halo_spatial_registers(build):
+    # cachebeta's first ambient 3D voice (halo docs/xdk/dsound-3d.md, section
+    # 10): lVolume -602 and Room = RoomHF = -1204 at pseudo-angles of 18 deg
+    # right, 6 deg down. Retail wrote these registers for it.
+    image = ApuImage(build)
+    pio = lambda method: image.words(0xfe820000 + method)[0]
+    filters, index = hrtf_tables(build)
+    desc = image.alloc(struct.pack("<6I", 0x10, 4, image.format(), image.callback, 42, 0))
+    out = image.alloc(bytes(4))
+    assert image.call("_DirectSoundCreateStream@12", desc, out, 0) == 0
+    stream, = image.words(out)
+    ds = 0
+    assert image.call("_IDirectSound_SetOrientation@32", ds, *floats(0, 0, 1, 0, 1, 0), 1) == 0
+    # Within MinDistance (1.0), as v0 was.
+    height = -1 / 15 * math.sqrt(1.16)
+    for side in (1, -1):
+        assert image.call("_IDirectSoundStream_SetPosition@20", stream, *floats(0.2 * side, height, 0.5), 1) == 0
+        params = image.alloc(struct.pack("<iiiififif", 0, 0, -1204, -1204, 0.0, 0, 0.0, 0, 0.25))
+        assert image.call("_IDirectSoundStream_SetAllParameters@12", stream, params, 1) == 0
+        assert image.call("_IDirectSoundStream_SetVolume@8", stream, -602) == 0
+        # Starting the voice commits the deferred settings.
         image.submit(stream, pcm(10000))
-        voice = image.voices[image.hardware(stream)]
+        hardware = image.hardware(stream)
+        assert image.voices[hardware]["type"] == 3  # NX_VOICE_TYPE_3D_STREAM
+        assert (pio(0x360), pio(0x364), pio(0x368)) == (0xffff181f, 0xffff181f, 0xffff483f)
+        assert (pio(0x374), pio(0x378)) == (0, 0xd8e10000)
+        assert pio(0x318) >> 16 & 3 == 3
+        # The stream's first voice wrote entry 0 for the origin at creation,
+        # so this pair takes entry 1; the flushed stream's next voice starts at 0.
+        assert pio(0x160) == pio(0x31c) == (1 if side > 0 else 0)
+        first = index[18 // 3][(-6 + 90) // 6]
+        near, far = filters[first], filters[first + 1]
+        s8 = lambda row: [v - 256 if v > 127 else v for v in row[:31]]
+        expected = hrir_words(near, far, near[31]) if side > 0 else hrir_words(far, near, -near[31])
+        assert [pio(0x400 + 4 * i) for i in range(16)] == expected
+        assert s8(near) != s8(far)
         image.complete(stream)
         image.service()
-        return tuple(round(g * 32768 / int(32768 * HEADROOM), 4) for g in voice["gain"])
-    image = None
-
-    class Image(ApuImage):
-        def __init__(self, build):
-            nonlocal image
-            super().__init__(build)
-            image = self
-    test_spatial_gain(build, Image, lambda stream: gains(image, stream))
+        # A flush retires the hardware voice, so the next start makes a new one.
+        assert image.call("_IDirectSoundBuffer_Stop@4", stream) == 0
+    # Distance, the reverb send and Doppler at 3.048 m per unit: a source
+    # 5 units ahead loses 20 log10(5) dB and, moving away at 10 units/s,
+    # plays at 1 - 3.048 / 342 * 10 of its rate.
+    assert image.call("_IDirectSound_SetDistanceFactor@12", ds, *floats(3.048), 0) == 0
+    assert image.call("_IDirectSoundStream_SetPosition@20", stream, *floats(0, 0, 5), 0) == 0
+    assert image.call("_IDirectSoundStream_SetVelocity@20", stream, *floats(0, 0, 10), 0) == 0
+    image.submit(stream, pcm(10000))
+    hardware = image.hardware(stream)
+    assert (pio(0x360), pio(0x368)) == (0xffff4fff, 0xffff801f)
+    assert abs(image.voices[hardware]["pitch"] - (1 - 3.048 / 342 * 10)) < 1e-4
+    assert image.call("_IDirectSound_SetVelocity@20", ds, *floats(0, 0, 10), 0) == 0
+    assert abs(image.voices[hardware]["pitch"] - 1) < 1e-6
+    image.complete(stream)
+    image.service()
+    image.release(stream)
 
 
 def test_static_buffer(build):
@@ -713,7 +773,7 @@ if __name__ == "__main__":
     for test in (test_four_packets_and_coalesced_completion, test_completion_before_next_process,
                  test_reference_voice_headroom, test_pause_gain_pitch_and_adpcm, test_stop_timeout_retains_ownership,
                  test_stop_timeout_late_completion,
-                 test_halo_channel_reuse, test_halo_channel_initialization, test_halo_spatial_gain,
+                 test_halo_channel_reuse, test_halo_channel_initialization, test_halo_spatial_registers,
                  test_static_buffer, test_buffer_pitch_is_absolute, test_adpcm_loop_region_in_samples,
                  test_driver_descriptor_retirement_and_pinning,
                  test_driver_pio_completion_interleaving,

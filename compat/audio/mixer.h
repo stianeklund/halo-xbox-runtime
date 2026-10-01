@@ -36,6 +36,14 @@ struct audio_voice {
   unsigned int buffer_size, buffer_cursor, loop_start, loop_end;
   int playing, looping;
   void *backend; /* Opaque nxdk-audio state; NULL for the software backend. */
+  /* Retail DirectSound's results for a mono DS_CTRL3D voice, which the APU
+   * backend plays on a hardware 3D voice: levels in mB for mix bins 6-10
+   * (front, rear, front, rear, I3DL2 send), TAR_FCB, the pseudo-angles that
+   * select its HRTF pair, and the Doppler frequency ratio. */
+  int is_3d;
+  int level[5];
+  unsigned int filter;
+  float azimuth, elevation, doppler;
 };
 #pragma pack(pop)
 

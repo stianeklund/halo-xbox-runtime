@@ -16,7 +16,13 @@ if(HALO_STANDALONE_AUDIO)
 	target_sources(standalone_crt PRIVATE ../compat/audio/mixer.c)
 	if(HALO_STANDALONE_AUDIO_BACKEND STREQUAL "apu")
 		include(nxaudio.cmake)
-		target_sources(standalone_crt PRIVATE nxdk_audio_apu.c)
+		add_custom_command(
+			OUTPUT "${gen_dir}/xdk_hrtf.h"
+			COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/gen_xdk_hrtf.py"
+				--xbe "${HALO_STANDALONE_LAYOUT_XBE}" --out "${gen_dir}/xdk_hrtf.h"
+			DEPENDS "${CMAKE_SOURCE_DIR}/tools/gen_xdk_hrtf.py" "${HALO_STANDALONE_LAYOUT_XBE}"
+			VERBATIM)
+		target_sources(standalone_crt PRIVATE nxdk_audio_apu.c "${gen_dir}/xdk_hrtf.h")
 		target_compile_definitions(standalone_crt PRIVATE HALO_AUDIO_APU=1)
 	else()
 		target_sources(standalone_crt PRIVATE nxdk_audio.c)

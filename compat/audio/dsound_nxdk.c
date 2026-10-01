@@ -1,8 +1,9 @@
 /* Xbox DirectSound ABI adapter over the nxdk AC97 stereo transport.
  * PCM and Xbox IMA ADPCM, software volume/pitch, streams and static buffers.
  * Packet callbacks run only from DirectSoundDoWork on the game thread.
- * 3D sources get distance, cone, occlusion and stereo pan gains; HRTF,
- * Doppler, reverb, DSP effects and surround mix bins remain unsupported. */
+ * 3D sources follow retail DirectSound's model; the APU backend plays mono
+ * ones on hardware 3D voices with the XDK HRTF. Reverb, DSP effects and
+ * surround mix bins remain unsupported. */
 #include "xbox.h"
 #include "mixer.h"
 #include "backend.h"
@@ -43,12 +44,22 @@ struct buffer_desc {
   unsigned int mix_bins;
   void *input_mix_bin;
 };
-/* DirectSound 3D state for one stream. Levels are hundredths of a dB. */
+/* DSI3DL2BUFFER, as Halo passes it. Levels are hundredths of a dB. */
+struct i3dl2_source {
+  int direct, direct_hf, room, room_hf;
+  float room_rolloff;
+  int obstruction;
+  float obstruction_ratio;
+  int occlusion;
+  float occlusion_ratio;
+};
+/* DirectSound 3D state for one stream. */
 struct spatial {
-  float position[3], cone[3];
+  float position[3], velocity[3], cone[3];
   float min_distance, max_distance;
   unsigned int inside_angle, outside_angle;
-  int cone_volume, direct, mode;
+  int cone_volume, mode;
+  struct i3dl2_source i3dl2;
 };
 struct sound_object;
 struct sound_inner {
@@ -88,6 +99,9 @@ static int mixed[1024 * 2];
  * peak sample magnitude, game packet-queue calls. Updated under the lock
  * except for the game-thread queue-call counter. */
 unsigned int halo_audio_mixer_stats[8];
+
+static void apply_3d(struct sound_object *o);
+static int apply_gain(struct sound_object *o);
 
 /* Integer exponents avoid pulling pdclib's math dependency closure into the
  * game's CRT. Each base represents one DirectSound volume/pitch unit. */
@@ -179,6 +193,8 @@ static int __stdcall stream_process(void *stream, const struct media_packet *inp
   packet.context = input->context;
   standalone_audio_lock();
   for (i = 0; i < AUDIO_PACKET_COUNT; i++) if (o->voice.packets[i].state) count++;
+  /* Retail commits a 3D voice's deferred settings when it starts playing. */
+  if (o->is_3d && !audio_voice_active(&o->voice)) apply_gain(o);
   accepted = o->refs && count < o->max_packets && audio_output_submit(&o->voice, &packet);
   halo_audio_mixer_stats[accepted ? 0 : 1]++;
   update_status(o);
@@ -251,13 +267,16 @@ static int create_object(const struct audio_format *format, int is_stream,
   o->is_3d = (flags & DS_CTRL3D) != 0;
   /* cachebeta's voice-settings constructor (0x2054a8) defaults to
    * 600 mB headroom for 2D voices and zero for DS_CTRL3D voices; see
-   * apply_gain for the matching 3D path level. */
+   * apply_gain for the software 3D level. */
   o->voice.gain_left = o->voice.gain_right = 16422;
+  o->voice.is_3d = o->is_3d;
   o->spatial.min_distance = 1.0f;
   o->spatial.max_distance = 1e9f;
   o->spatial.inside_angle = o->spatial.outside_angle = 360;
   o->spatial.cone[2] = 1.0f;
+  o->spatial.i3dl2.occlusion_ratio = 0.25f;
   standalone_audio_lock();
+  if (o->is_3d) apply_3d(o);
   if (!audio_output_create(&o->voice, is_stream)) {
     standalone_audio_unlock();
     audio_free(o);
@@ -436,9 +455,12 @@ int __stdcall nxds_speakers(void *ds, unsigned int *config)
   return DS_OK;
 }
 
-/* Listener state, already in DirectSound's Y-up axes (Halo swaps Y/Z). */
-static float listener_position[3], listener_front[3] = {0, 0, 1}, listener_top[3] = {0, 1, 0};
-static float listener_rolloff = 1.0f;
+/* Listener state, already in DirectSound's Y-up axes (Halo swaps Y/Z). Of
+ * the I3DL2 listener, only the room rolloff and HF reference reach voices. */
+static float listener_position[3], listener_velocity[3];
+static float listener_front[3] = {0, 0, 1}, listener_top[3] = {0, 1, 0};
+static float listener_rolloff = 1.0f, listener_distance = 1.0f, listener_doppler = 1.0f;
+static float listener_room_rolloff, listener_hf_reference = 5000.0f;
 
 /* x87 instructions keep pdclib's math closure out, as unit_power does. */
 static double root(double x)
@@ -453,77 +475,144 @@ static double cosine(double x)
   return x;
 }
 
+static double log10_of(double x)
+{
+  __asm__("fldlg2\n\tfxch\n\tfyl2x" : "+t"(x));
+  return x;
+}
+
 static double level_gain(int level)
 {
   if (level <= -10000) return 0.0;
   return level >= 0 ? 1.0 : unit_power(0.9988493699365052, (unsigned int)-level);
 }
 
-/* Cone level at the listener, interpolated on the cosine of the angle
- * between the cone orientation and the source-to-listener direction. */
-static int cone_level(const struct spatial *s, const double *to_listener)
+static float dot(const float *a, const float *b)
 {
-  double length = root((double)s->cone[0] * s->cone[0] + (double)s->cone[1] * s->cone[1] +
-                       (double)s->cone[2] * s->cone[2]), c, inside, outside;
-  if (s->inside_angle >= 360 && s->outside_angle >= 360) return 0;
-  if (length <= 0.0) return 0;
-  c = (to_listener[0] * s->cone[0] + to_listener[1] * s->cone[1] + to_listener[2] * s->cone[2]) / length;
-  inside = cosine(s->inside_angle * 3.14159265358979 / 360.0);
-  outside = cosine(s->outside_angle * 3.14159265358979 / 360.0);
-  if (c >= inside) return 0;
-  if (c <= outside || inside <= outside) return s->cone_volume;
-  return (int)(s->cone_volume * (inside - c) / (inside - outside));
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 
-/* Combine volume, mix-bin levels and the 3D model into the voice's L/R
- * gains. Distance uses DirectSound's inverse rolloff, clamped at max
- * distance. The I3DL2 direct path applies occlusion/obstruction at their
- * low-frequency ratio; their high-frequency filtering is not modelled.
- * Panning approximates HRTF head shadow: the far ear keeps 30% at 90 deg.
- * Setters accept out-of-range values as the stubs did; this clamps them.
- * 2D voices carry the reference 600 mB headroom. Retail plays DS_CTRL3D
- * voices through the HRTF submixes instead, which these 2D voices bypass;
- * recordings against cachebeta put that path 6 dB below the source, so 3D
- * voices take the same 600 mB until they use hardware 3D voices.
- * Caller holds the audio lock. */
-static int apply_gain(struct sound_object *o)
+static int clamp_level(int level)
+{
+  return level < -10000 ? -10000 : level > 0 ? 0 : level;
+}
+
+/* Pole of the one-pole low-pass whose power gain at the listener's HF
+ * reference is hf mB (cachebeta 0x20a842), in Q16. */
+static unsigned int i3dl2_coefficient(int hf)
+{
+  double c, g, a;
+  if (!hf) return 0;
+  c = cosine(2.0 * (3.14159274f / 48000.0f) * listener_hf_reference);
+  g = hf < 0 ? unit_power(0.9977000638225533, (unsigned int)-hf)
+             : unit_power(1.0023052380778996, (unsigned int)hf);
+  a = ((1.0 - c * g) - root(2.0 * (1.0 - c) * g - (1.0 - c * c) * g * g)) / (1.0 - g);
+  return a < 1.0 ? (unsigned int)(int)(a * 65536.0f) : 0xffff;
+}
+
+/* Retail DirectSound's 3D voice model (cachebeta 0x2083a6-0x20a9b9; see
+ * halo docs/xdk/dsound-3d.md), for a stereo speaker configuration: rear
+ * bins muted, no rear HRTF fold. Angles are its octant pseudo-angles and
+ * the listener's right axis is top x front, unnormalized. DistanceFactor
+ * only scales Doppler. Caller holds the audio lock. */
+static void apply_3d(struct sound_object *o)
 {
   const struct spatial *s = &o->spatial;
-  float min_distance = s->min_distance > 0.0f ? s->min_distance : 0.0f;
-  double gain = level_gain(o->volume) * level_gain(-600), left, right;
-  double offset[3], distance, clamped, pan, right_axis[3], axis_length;
-  int i;
+  const struct i3dl2_source *i = &s->i3dl2;
+  struct audio_voice *v = &o->voice;
+  float rel[3], right[3], offset[3], x, z, u, a, h, cone, occlusion, occlusion_hf, room;
+  float azimuth = 0.0f, elevation = 0.0f, doppler = 1.0f, speed;
+  double distance = 0.0, ratio;
+  int k, distance_level = 0, cone_level = 0, direct = 0, direct_hf = 0, room_level = -10000, room_hf = 0;
+  if (s->mode != DS3DMODE_DISABLE) {
+    for (k = 0; k < 3; k++)
+      rel[k] = s->position[k] - (s->mode == DS3DMODE_HEADRELATIVE ? 0.0f : listener_position[k]);
+    distance = root((double)rel[0] * rel[0] + (double)rel[1] * rel[1] + (double)rel[2] * rel[2]);
+    if (distance > 0.0)
+      for (k = 0; k < 3; k++) rel[k] = (float)(rel[k] / distance);
+    right[0] = listener_top[1] * listener_front[2] - listener_top[2] * listener_front[1];
+    right[1] = listener_top[2] * listener_front[0] - listener_top[0] * listener_front[2];
+    right[2] = listener_top[0] * listener_front[1] - listener_top[1] * listener_front[0];
+    z = dot(listener_front, rel);
+    x = dot(right, rel);
+    if (distance != 0.0) {
+      u = dot(listener_top, rel);
+      a = u < 0.0f ? -u : u;
+      h = (float)root((double)z * z + (double)x * x);
+      elevation = h <= a ? 90.0f - h / a * 45.0f : a / h * 45.0f;
+      if (u < 0.0f) elevation = -elevation;
+      a = z < 0.0f ? -z : z;
+      h = x < 0.0f ? -x : x;
+      if (a <= h) azimuth = h == 0.0f ? 0.0f : 90.0f - a / h * 45.0f;
+      else azimuth = h / a * 45.0f;
+    }
+    if (z < 0.0f) azimuth = 180.0f - azimuth;
+    if (x < 0.0f) azimuth = -azimuth;
+    if (s->min_distance < distance && listener_rolloff > 0.0f) {
+      ratio = s->max_distance > distance ? distance / s->min_distance * listener_rolloff
+                                         : (s->max_distance / s->min_distance - 1.0f) * listener_rolloff + 1.0f;
+      distance_level = clamp_level((int)(log10_of(ratio) * -2000.0f));
+    }
+    for (k = 0; k < 3; k++) offset[k] = s->cone[k] - rel[k];
+    a = (float)root(dot(offset, offset));
+    for (k = 0; k < 3; k++) offset[k] = s->cone[k] + rel[k];
+    h = (float)root(dot(offset, offset));
+    cone = h < a ? h / a * 180.0f : (90.0f - a / h * 45.0f) * 4.0f;
+    if ((float)s->inside_angle < cone) {
+      if (s->inside_angle < s->outside_angle && !((float)s->outside_angle > cone))
+        cone_level = s->cone_volume;
+      else
+        cone_level = clamp_level((int)((cone - s->inside_angle) * s->cone_volume /
+          (float)(s->outside_angle - s->inside_angle ? s->outside_angle - s->inside_angle : 1)));
+    }
+    for (k = 0; k < 3; k++) offset[k] = s->velocity[k] - listener_velocity[k];
+    speed = dot(offset, rel);
+    speed = speed < -341.0f ? -341.0f : speed > 341.0f ? 341.0f : speed;
+    doppler = 1.0f - listener_distance / 342.0f * listener_doppler * speed;
+    if (doppler > 10.0f) doppler = 10.0f;
+    occlusion = i->occlusion * i->occlusion_ratio;
+    direct = (int)(i->obstruction * i->obstruction_ratio + occlusion) + i->direct;
+    occlusion_hf = (1.0f - i->occlusion_ratio) * i->occlusion;
+    direct_hf = (int)((1.0f - i->obstruction_ratio) * i->obstruction + occlusion_hf) + i->direct_hf;
+    room = occlusion;
+    if (distance > 1.0)
+      room = occlusion - listener_room_rolloff * i->room_rolloff * (int)(log10_of(distance) * 2000.0f);
+    /* Retail reuses lRoom here; lRoomHF is never read. */
+    room_level = (int)room + i->room;
+    room_hf = (int)occlusion_hf + i->room;
+  }
+  v->level[0] = v->level[2] = o->volume + cone_level + distance_level + direct;
+  v->level[1] = v->level[3] = s->mode == DS3DMODE_DISABLE ? v->level[0] : -10000;
+  v->level[4] = o->volume + cone_level + distance_level + room_level;
+  v->filter = s->mode == DS3DMODE_DISABLE ? 0 : i3dl2_coefficient(room_hf) << 16 | i3dl2_coefficient(direct_hf);
+  v->azimuth = azimuth;
+  v->elevation = elevation;
+  v->doppler = doppler;
+}
+
+/* Combine volume and mix-bin levels into the voice's L/R gains. 2D voices
+ * carry the reference 600 mB headroom. A mono 3D voice takes its front
+ * level and, for the software mixer, which has no HRTF, a head-shadow pan
+ * on the source's right-axis direction cosine: the far ear keeps 30% at
+ * 90 deg. Retail's 3D path measured 6 dB below its front level in xemu
+ * recordings against cachebeta, so the software mix keeps 600 mB there
+ * too. Setters accept out-of-range values as the stubs did; this clamps
+ * them. Caller holds the audio lock. */
+static int apply_gain(struct sound_object *o)
+{
+  double gain = level_gain(o->volume) * level_gain(-600), left, right, pan;
   left = o->mix_bins & 1 ? level_gain(o->bin_volume[0]) : 0.0;
   right = o->mix_bins & 2 ? level_gain(o->bin_volume[1]) : 0.0;
-  if (o->is_3d) {
-    gain *= level_gain(s->direct);
-    if (s->mode != DS3DMODE_DISABLE) {
-      for (i = 0; i < 3; i++)
-        offset[i] = s->position[i] - (s->mode == DS3DMODE_HEADRELATIVE ? 0.0f : listener_position[i]);
-      distance = root(offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]);
-      clamped = distance < s->max_distance ? distance : s->max_distance;
-      if (clamped > min_distance && min_distance > 0.0f)
-        gain *= min_distance / (min_distance + listener_rolloff * (clamped - min_distance));
-      if (distance > 0.0) {
-        double to_listener[3];
-        for (i = 0; i < 3; i++) to_listener[i] = -offset[i] / distance;
-        gain *= level_gain(cone_level(s, to_listener));
-        if (s->mode == DS3DMODE_HEADRELATIVE) {
-          right_axis[0] = 1.0; right_axis[1] = right_axis[2] = 0.0;
-        } else {
-          right_axis[0] = (double)listener_top[1] * listener_front[2] - (double)listener_top[2] * listener_front[1];
-          right_axis[1] = (double)listener_top[2] * listener_front[0] - (double)listener_top[0] * listener_front[2];
-          right_axis[2] = (double)listener_top[0] * listener_front[1] - (double)listener_top[1] * listener_front[0];
-        }
-        axis_length = root(right_axis[0] * right_axis[0] + right_axis[1] * right_axis[1] + right_axis[2] * right_axis[2]);
-        if (axis_length > 0.0) {
-          pan = (offset[0] * right_axis[0] + offset[1] * right_axis[1] + offset[2] * right_axis[2]) /
-                (distance * axis_length);
-          if (pan > 0.0) left *= 1.0 - 0.7 * pan;
-          else right *= 1.0 + 0.7 * pan;
-        }
-      }
-    }
+  if (o->voice.is_3d) {
+    apply_3d(o);
+    gain = level_gain(o->voice.level[0]) * level_gain(-600);
+    left = right = 1.0;
+    pan = o->voice.azimuth;
+    if (pan > 90.0) pan = 180.0 - pan;
+    else if (pan < -90.0) pan = -180.0 - pan;
+    pan /= 90.0;
+    if (pan > 0.0) left -= 0.7 * pan;
+    else right += 0.7 * pan;
   }
   o->voice.gain_left = (int)(32768.0 * gain * left);
   o->voice.gain_right = (int)(32768.0 * gain * right);
@@ -582,20 +671,16 @@ int __stdcall IDirectSoundStream_SetMixBinVolumes_12(void *stream, unsigned int 
   return stream_changed(o, 0);
 }
 
-/* The XDK export Halo calls here takes a DSI3DL2BUFFER: direct, direct HF,
- * room, room HF, room rolloff, obstruction {HF, LF ratio}, occlusion {HF,
- * LF ratio}. Room/reverb sends have no output path yet. */
+/* Halo's export here (0x2053a7) jumps to CDirectSoundStream_SetI3DL2Source
+ * and takes a DSI3DL2BUFFER. The room level feeds mix bin 10, the I3DL2
+ * reverb send, which needs Halo's DSP image to be heard. */
 int __stdcall IDirectSoundStream_SetAllParameters(void *stream, void *params,
                                                  int apply)
 {
   struct sound_object *o = stream;
-  const int *levels = params;
-  const float *ratios = params;
-  int direct;
   if (!params) return DS_INVALID;
-  direct = levels[0] + (int)(levels[5] * ratios[6]) + (int)(levels[7] * ratios[8]);
   standalone_audio_lock();
-  o->spatial.direct = direct < -10000 ? -10000 : direct > 0 ? 0 : direct;
+  o->spatial.i3dl2 = *(const struct i3dl2_source *)params;
   return stream_changed(o, apply);
 }
 
@@ -618,16 +703,15 @@ int __stdcall IDirectSoundStream_SetPosition(void *stream, float x, float y, flo
   return stream_changed(o, apply);
 }
 
-/* Doppler is not modelled. */
 int __stdcall IDirectSoundStream_SetVelocity(void *stream, float x, float y, float z,
                                             int apply)
 {
-  (void)stream;
-  (void)x;
-  (void)y;
-  (void)z;
-  (void)apply;
-  return DS_OK;
+  struct sound_object *o = stream;
+  standalone_audio_lock();
+  o->spatial.velocity[0] = x;
+  o->spatial.velocity[1] = y;
+  o->spatial.velocity[2] = z;
+  return stream_changed(o, apply);
 }
 
 int __stdcall IDirectSoundStream_SetConeOrientation(void *stream, float x, float y, float z,
@@ -707,11 +791,51 @@ int __stdcall IDirectSound_SetOrientation(void *ds, float front_x, float front_y
   return listener_changed(apply);
 }
 
+int __stdcall IDirectSound_SetVelocity(void *ds, float x, float y, float z, unsigned int apply)
+{
+  (void)ds;
+  standalone_audio_lock();
+  listener_velocity[0] = x;
+  listener_velocity[1] = y;
+  listener_velocity[2] = z;
+  return listener_changed(apply);
+}
+
 int __stdcall IDirectSound_SetRolloffFactor(void *ds, float rolloff, unsigned int apply)
 {
   (void)ds;
   standalone_audio_lock();
   listener_rolloff = rolloff >= 0.0f ? rolloff : 0.0f;
+  return listener_changed(apply);
+}
+
+/* Halo sets 3.048 (metres per world unit) for Doppler. */
+int __stdcall IDirectSound_SetDistanceFactor(void *ds, float factor, unsigned int apply)
+{
+  (void)ds;
+  standalone_audio_lock();
+  listener_distance = factor;
+  return listener_changed(apply);
+}
+
+int __stdcall nxds_doppler(void *ds, float factor, unsigned int apply) __asm__("_IDirectSound_SetDopplerFactor@12");
+int __stdcall nxds_doppler(void *ds, float factor, unsigned int apply)
+{
+  (void)ds;
+  standalone_audio_lock();
+  listener_doppler = factor;
+  return listener_changed(apply);
+}
+
+/* DSI3DL2LISTENER. Its reverb parameters belong to Halo's DSP image. */
+int __stdcall IDirectSound_SetI3DL2Listener(void *ds, const void *params, unsigned int apply)
+{
+  const float *values = params;
+  (void)ds;
+  if (!params) return DS_INVALID;
+  standalone_audio_lock();
+  listener_room_rolloff = values[2];
+  listener_hf_reference = values[11];
   return listener_changed(apply);
 }
 
@@ -796,6 +920,7 @@ int __stdcall IDirectSoundBuffer_Play(void *buffer, uint32_t reserved, uint32_t 
   if (!o->voice.buffer || !o->voice.buffer_size) { standalone_audio_unlock(); return DS_INVALID; }
   o->voice.looping = flags & 1;
   o->voice.playing = 1;
+  if (o->is_3d) apply_gain(o);
   if (!audio_output_buffer_play(&o->voice)) {
     o->voice.playing = 0;
     standalone_audio_unlock();

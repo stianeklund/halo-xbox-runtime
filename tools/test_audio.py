@@ -175,6 +175,10 @@ class AudioImage:
         self.call("_sound_dsound_update_channel_properties", properties, index, 0)
 
 
+def floats(*values):
+    return [struct.unpack("<I", struct.pack("<f", v))[0] for v in values]
+
+
 def pcm(*samples):
     return struct.pack("<" + "h" * len(samples), *samples)
 
@@ -471,30 +475,37 @@ def test_game_channel_initialization(build, image_type=AudioImage, playback=None
         image.release(stream)
 
 
-def test_spatial_gain(build, image_type=AudioImage, gains=None):
-    image = image_type(build)
-    if gains is None:
-        def gains(stream):
-            image.submit(stream, pcm(10000))
-            left, right = image.render(1)
-            image.service()
-            scale = output_samples((10000,))[0]
-            return left / scale, right / scale
+def test_spatial_gain(build):
+    # Retail DirectSound's 3D model (halo docs/xdk/dsound-3d.md) through the
+    # software mixer: front level at 600 mB below unity, head-shadow pan.
+    image = AudioImage(build)
+
+    def gains(stream):
+        image.submit(stream, pcm(10000))
+        left, right = image.render(1)
+        image.service()
+        scale = output_samples((10000,))[0]
+        return left / scale, right / scale
     desc = image.alloc(struct.pack("<IIIIII", 0x10, 4, image.format(), image.callback, 42, 0))
     out = image.alloc(bytes(4))
     assert image.call("_DirectSoundCreateStream@12", desc, out, 0) == 0
     stream, = image.words(out)
-    floats = lambda *values: [struct.unpack("<I", struct.pack("<f", v))[0] for v in values]
     ds = 0
     assert image.call("_IDirectSound_SetOrientation@32", ds, *floats(0, 0, 1, 0, 1, 0), 0) == 0
-    assert image.call("_IDirectSoundStream_SetMinDistance@12", stream, *floats(2.0), 1) == 0
-    # Deferred: no change until the per-frame commit.
-    assert image.call("_IDirectSoundStream_SetPosition@20", stream, *floats(0, 0, 8), 1) == 0
     assert gains(stream) == (1.0, 1.0)
+    # Deferred: a voice that keeps playing waits for the per-frame commit.
+    # Retail commits pending settings when a voice starts.
+    image.submit(stream, pcm(10000, 10000))
+    unity = image.render(1)
+    assert image.call("_IDirectSoundStream_SetMinDistance@12", stream, *floats(2.0), 1) == 0
+    assert image.call("_IDirectSoundStream_SetPosition@20", stream, *floats(0, 0, 8), 1) == 0
+    assert image.render(1) == unity
+    image.service()
     assert image.call("_IDirectSound_CommitDeferredSettings@4", ds) == 0
+    # -20 log10(8 / 2) dB.
     left, right = gains(stream)
     assert abs(left - 0.25) < 0.001 and left == right, (left, right)
-    # Max distance clamps attenuation; rolloff scales it.
+    # Beyond max distance, retail holds the level at max / min.
     assert image.call("_IDirectSoundStream_SetMaxDistance@12", stream, *floats(4.0), 0) == 0
     assert abs(gains(stream)[0] - 0.5) < 0.001
     assert image.call("_IDirectSound_SetRolloffFactor@12", ds, *floats(0.0), 0) == 0
@@ -504,27 +515,29 @@ def test_spatial_gain(build, image_type=AudioImage, gains=None):
     assert image.call("_IDirectSoundStream_SetPosition@20", stream, *floats(2, 0, 0), 0) == 0
     left, right = gains(stream)
     assert right == 1.0 and abs(left - 0.3) < 0.001, (left, right)
-    # Disabled 3D and the listener moving on top of it both restore unity.
-    assert image.call("_IDirectSound_SetPosition@20", ds, *floats(2, 0, 0), 0) == 0
-    assert gains(stream) == (1.0, 1.0)
+    # Disabled 3D plays at the plain volume, even far away.
     assert image.call("_IDirectSoundStream_SetPosition@20", stream, *floats(100, 0, 0), 0) == 0
     assert image.call("_IDirectSoundStream_SetMode@12", stream, 2, 0) == 0
     assert gains(stream) == (1.0, 1.0)
-    # I3DL2 direct level plus occlusion at its low-frequency ratio: -600 + -1000 * 0.2.
+    # Retail ignores I3DL2 sources in DISABLE mode...
     params = image.alloc(struct.pack("<iiiififif", -600, 0, 0, 0, 0.0, -10000, 0.0, -1000, 0.2))
     assert image.call("_IDirectSoundStream_SetAllParameters@12", stream, params, 0) == 0
+    assert gains(stream) == (1.0, 1.0)
+    # ...but applies the direct level and occlusion's LF share otherwise:
+    # -600 + -1000 * 0.2, and obstruction at LF ratio 0.
+    assert image.call("_IDirectSound_SetPosition@20", ds, *floats(100, 0, 0), 0) == 0
+    assert image.call("_IDirectSoundStream_SetMode@12", stream, 0, 0) == 0
     left, right = gains(stream)
     assert abs(left - 0.3981) < 0.002 and left == right, (left, right)
-    # Volume combines with the 3D level; mix bins select the stereo sides.
     assert image.call("_IDirectSoundStream_SetVolume@8", stream, -10000) == 0
     assert gains(stream) == (0.0, 0.0)
     assert image.call("_IDirectSoundStream_SetVolume@8", stream, 0) == 0
+    # A 3D voice's mix bins are fixed; retail ignores the 2D bin settings.
     volumes = image.alloc(struct.pack("<iii", -10000, 0, -10000))
     assert image.call("_IDirectSoundStream_SetMixBinVolumes_12@12", stream, 7, volumes) == 0
-    left, right = gains(stream)
-    assert left == 0.0 and abs(right - 0.3981) < 0.002
     assert image.call("_IDirectSoundStream_SetMixBins@8", stream, 1) == 0
-    assert gains(stream) == (0.0, 0.0)
+    left, right = gains(stream)
+    assert abs(left - 0.3981) < 0.002 and left == right, (left, right)
     image.release(stream)
 
 
