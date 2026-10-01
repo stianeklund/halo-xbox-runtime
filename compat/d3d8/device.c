@@ -802,6 +802,49 @@ static void gpu_bind_targets(void)
   d3d_targets_dirty = 0;
 }
 
+/* 0x1ea820..0x1ea932: Clear works inside the current viewport. With no rects
+ * the viewport itself is the rect; otherwise each rect is clipped to it, and
+ * an empty result is skipped. The clipped edges are then scaled by the
+ * super-sample factors, + 0.5 and truncated. */
+static int clear_rect(const d3d_rect *rect, d3d_rect *out)
+{
+  long vx1;
+  long vy1;
+  long vx2;
+  long vy2;
+  long x1;
+  long y1;
+  long x2;
+  long y2;
+  float sx;
+  float sy;
+
+  vx1 = (long)*device_field(DEVICE_VIEWPORT);
+  vy1 = (long)*device_field(DEVICE_VIEWPORT + 4);
+  vx2 = vx1 + (long)*device_field(DEVICE_VIEWPORT + 8);
+  vy2 = vy1 + (long)*device_field(DEVICE_VIEWPORT + 12);
+  x1 = vx1;
+  y1 = vy1;
+  x2 = vx2;
+  y2 = vy2;
+  if (rect) {
+    x1 = rect->x1 > vx1 ? rect->x1 : vx1;
+    y1 = rect->y1 > vy1 ? rect->y1 : vy1;
+    x2 = rect->x2 < vx2 ? rect->x2 : vx2;
+    y2 = rect->y2 < vy2 ? rect->y2 : vy2;
+  }
+  if (x1 >= x2 || y1 >= y2) {
+    return 0;
+  }
+  sx = *(float *)device_field(DEVICE_SUPER_SAMPLE_SCALE_X);
+  sy = *(float *)device_field(DEVICE_SUPER_SAMPLE_SCALE_Y);
+  out->x1 = (long)((float)x1 * sx + 0.5f);
+  out->x2 = (long)((float)x2 * sx + 0.5f);
+  out->y1 = (long)((float)y1 * sy + 0.5f);
+  out->y2 = (long)((float)y2 * sy + 0.5f);
+  return 1;
+}
+
 static void gpu_clear(const d3d_rect *rect, unsigned long flags,
                       unsigned long color, unsigned long depth)
 {
@@ -1751,6 +1794,7 @@ void __stdcall D3DDevice_Clear(uint32_t count, void *rects, uint32_t flags,
                                uint32_t color, float z, uint32_t stencil)
 {
   const d3d_rect *rect;
+  d3d_rect clip;
   unsigned long keep;
   unsigned long depth;
   uint32_t i;
@@ -1804,7 +1848,9 @@ void __stdcall D3DDevice_Clear(uint32_t count, void *rects, uint32_t flags,
       flags &= ~(uint32_t)(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL);
     }
     for (i = 0; i == 0 || i < count; i++) {
-      gpu_clear(count ? &rect[i] : 0, flags, color, depth);
+      if (clear_rect(count ? &rect[i] : 0, &clip)) {
+        gpu_clear(&clip, flags, color, depth);
+      }
     }
     if (swizzled_format) {
       p = compat_d3d_push_reserve(2);
@@ -1814,8 +1860,11 @@ void __stdcall D3DDevice_Clear(uint32_t count, void *rects, uint32_t flags,
     return;
   }
   for (i = 0; i == 0 || i < count; i++) {
-    const d3d_rect *r = count ? &rect[i] : 0;
+    const d3d_rect *r = &clip;
 
+    if (!clear_rect(count ? &rect[i] : 0, &clip)) {
+      continue;
+    }
     if (keep != 0xfffffffful && d3d_render_target) {
       surface_fill(d3d_render_target, r, color, keep);
     }
