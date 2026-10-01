@@ -29,7 +29,8 @@ def main():
         target = args.output / source.relative_to(args.source)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
-    subprocess.run(["patch", "--batch", "--forward", "-p1", "-i", str(args.patch.resolve())],
+    subprocess.run(["patch", "--batch", "--forward", "--fuzz=0", "--no-backup-if-mismatch", "-p1",
+                    "-i", str(args.patch.resolve())],
                    cwd=args.output, check=True)
     program = args.output / "passthrough.out"
     subprocess.run([str(args.assembler), "-f", "lod", "-o", str(program),

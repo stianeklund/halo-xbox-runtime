@@ -128,6 +128,27 @@ static void inject(struct netif *n, const unsigned char *data, unsigned size)
   assert(p && pbuf_take(p, data, size) == ERR_OK);
   assert(halo_xnet_input(p, n) == ERR_OK);
 }
+/* Plaintext UDP broadcast "halo" from source:source_port to port 1000. */
+static void inject_plain(struct netif *n, const unsigned char source[4],
+                         unsigned source_port)
+{
+  unsigned char data[14 + 32] = {
+    0xff,0xff,0xff,0xff,0xff,0xff, 2,0,0,0,0,3, 0x08,0x00,
+    0x45,0,0,32, 0,0,0,0, 64,17};
+  unsigned char *ip = data + 14, *udp = ip + 20;
+  unsigned sum = 0, i;
+  memcpy(ip + 12, source, 4);
+  memset(ip + 16, 255, 4);
+  for (i = 0; i < 20; i += 2) sum += ip[i] << 8 | ip[i + 1];
+  while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+  ip[10] = ~sum >> 8; ip[11] = ~sum;
+  udp[0] = source_port >> 8; udp[1] = source_port;
+  udp[2] = 1000 >> 8; udp[3] = 1000 & 255;
+  udp[5] = 12;
+  memcpy(udp + 8, "halo", 4);
+  inject(n, data, sizeof(data));
+}
+static const unsigned char lan_host[4] = {10,0,0,2}, virtual_host[4] = {0,0,0,2};
 static struct tcp_pcb *local_accepted;
 static unsigned local_connected, local_received;
 static err_t recv_local(void *user, struct tcp_pcb *pcb, struct pbuf *p, err_t error)
@@ -201,6 +222,14 @@ int main(void)
   assert(netif_add(&physical, &zero, &zero, &zero, NULL, physical_init, ip4_input));
   netif_set_default(&physical); netif_set_up(&physical); netif_set_link_up(&physical);
   halo_xnet_attach(&physical);
+  /* Before startup the 0/8 route has no transport and must not leak. */
+  udp = udp_new(); assert(udp);
+  p = pbuf_alloc(PBUF_TRANSPORT, 4, PBUF_RAM); assert(p);
+  assert(pbuf_take(p, "halo", 4) == ERR_OK);
+  IP_ADDR4(&dest, 0,0,0,2);
+  assert(udp_sendto(udp, p, &dest, 1000) == ERR_RTE);
+  assert(frames_sent == 0 && plain_sent == 0);
+  pbuf_free(p); udp_remove(udp);
   assert(halo_net_security_start(0) == 0);
   udp = udp_new(); assert(udp && udp_bind(udp, IP_ADDR_ANY, 1000) == ERR_OK);
   udp->so_options |= SOF_BROADCAST;
@@ -229,6 +258,12 @@ int main(void)
   run_callbacks();
   assert(received == 2 && frames_sent == 1);
   test_local_server();
+  /* Secure startup: no plaintext reaches title sockets, whatever its ports
+   * or claimed virtual source. */
+  inject_plain(&physical, lan_host, 53);
+  inject_plain(&physical, lan_host, 1000);
+  inject_plain(&physical, virtual_host, 1000);
+  assert(received == 2);
   assert(halo_net_register(id, key) == 0 && halo_net_map(&peer, id, &mapped) == 0);
   ip_addr_set_ip4_u32(&dest, mapped);
   tcp = tcp_new(); assert(tcp);
@@ -244,10 +279,16 @@ int main(void)
   IP_ADDR4(&dest, 255,255,255,255);
   assert(udp_sendto(udp, p, &dest, 1000) == ERR_OK);
   assert(plain_sent == 0 && !memcmp(frame + 42, "\xff\xff\xff\xff", 4));
+  /* Bypass startup admits LAN plaintext, but never from a virtual address. */
+  udp_recv(udp, recv_udp, NULL);
+  inject_plain(&physical, lan_host, 1000);
+  assert(received == 3);
+  inject_plain(&physical, virtual_host, 1000);
+  assert(received == 3);
   pbuf_free(p); udp_remove(udp); halo_net_security_clear();
   extern void test_debug_netif(void);
   test_debug_netif();
   OSSL_PROVIDER_unload(legacy); OSSL_PROVIDER_unload(normal);
-  puts("PASS: real lwIP discovery without DHCP, packet checksums, tamper rejection, UDP loopback, local TCP server on 5150, TCP secure routing, bypass broadcast and shared XBDM NIC ownership/address separation");
+  puts("PASS: real lwIP discovery without DHCP, packet checksums, tamper rejection, UDP loopback, local TCP server on 5150, TCP secure routing, bypass broadcast, fail-closed plaintext filtering and shared XBDM NIC ownership/address separation");
   return 0;
 }

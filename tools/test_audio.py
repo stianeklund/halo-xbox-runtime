@@ -339,6 +339,23 @@ def test_static_buffer(build):
     assert buffer in image.freed
 
 
+def test_buffer_pitch_is_absolute(build):
+    # progress_bar.c pitches 22.05 kHz buffers; pitch 0 means 48 kHz, not native.
+    image = AudioImage(build)
+    desc = image.alloc(struct.pack("<IIIIII", 24, 0, 6, image.format(rate=22050), 3, 0))
+    out = image.alloc(bytes(4))
+    assert image.call("_DirectSoundCreateBuffer@8", desc, out) == 0
+    buffer, = image.words(out)
+    data = image.alloc(pcm(100, 200, 300))
+    assert image.call("_IDirectSoundBuffer_SetBufferData@12", buffer, data, 6) == 0
+    assert image.call("_IDirectSoundBuffer_SetPitch@8", buffer, 0) == 0
+    image.call("_IDirectSoundBuffer_Play@16", buffer, 0, 0, 0)
+    assert image.render(3)[::2] == output_samples((100, 200, 300))
+    assert image.call("_IDirectSoundBuffer_SetPitch@8", buffer, -8773) == 0
+    assert image.call("_IDirectSoundBuffer_SetPitch@8", buffer, 8192) == 0x80070057
+    assert image.call("_IDirectSoundBuffer_Release@4", buffer) == 0
+
+
 def test_event_and_release(build):
     image = AudioImage(build)
     stream = image.stream(callback=False, capacity=1)
@@ -665,7 +682,7 @@ def test_worker_without_spdif_callbacks(build):
 if __name__ == "__main__":
     build = Path(sys.argv[1] if len(sys.argv) > 1 else "build-seed")
     for test in (test_output_clipping, test_stream_lifecycle, test_capacity_flush_pause, test_resampling_volume_mix,
-                 test_adpcm, test_static_buffer, test_event_and_release,
+                 test_adpcm, test_static_buffer, test_buffer_pitch_is_absolute, test_event_and_release,
                  test_validation_and_reentrant_callbacks, test_game_channel_initialization,
                  test_spatial_gain,
                  test_game_channel_packets,

@@ -80,7 +80,7 @@ void __stdcall standalone_Sleep(unsigned long milliseconds)
 }
 
 /* 0x1d0bb9: RtlAllocateHeap on the process heap with HEAP_ZERO_MEMORY taken
- * from LMEM_ZEROINIT, i.e. LocalAlloc semantics. Shares xapi_heap.c's
+ * from LMEM_ZEROINIT, i.e. LocalAlloc semantics. Shares heap.c's
  * blocks so LocalFree / LocalSize work on the result. */
 void *__stdcall standalone_heap_alloc(unsigned int flags, unsigned int size)
 {

@@ -793,11 +793,15 @@ int __stdcall IDirectSoundBuffer_Play(void *buffer, uint32_t reserved, uint32_t 
 int __stdcall IDirectSoundBuffer_Stop(void *buffer) { return stream_flush(buffer); }
 int __stdcall IDirectSoundBuffer_Release(void *buffer) { return (int)object_release(buffer); }
 int __stdcall IDirectSoundBuffer_SetVolume(void *buffer, int volume) { return IDirectSoundStream_SetVolume(buffer, volume); }
+/* XDK pitch is absolute, the APU's voice encoding 4096 * log2(f / 48000),
+ * not relative to the buffer's rate: Halo pitches its 22.05 kHz loading-bar
+ * sounds near -4597. The range spans DSBFREQUENCY_MIN..MAX (188..191999). */
+#define DSBPITCH_MIN (-32768)
+#define DSBPITCH_MAX 8191
 int __stdcall IDirectSoundBuffer_SetPitch(void *buffer, int pitch)
 {
-  struct sound_object *o = buffer;
-  if (pitch < -8192 || pitch > 8191) return DS_INVALID;
-  return IDirectSoundStream_SetFrequency(buffer, (int)((double)o->voice.format.rate *
+  if (pitch < DSBPITCH_MIN || pitch > DSBPITCH_MAX) return DS_INVALID;
+  return IDirectSoundStream_SetFrequency(buffer, (int)(AUDIO_RATE *
     unit_power(pitch < 0 ? 0.9998307889319291 : 1.000169239705302, (unsigned int)(pitch < 0 ? -pitch : pitch)) + 0.5));
 }
 

@@ -79,7 +79,9 @@ Local upstream patches clear completed streaming SSL descriptors before
 unlocking their buffers (otherwise persistent voices can replay stale data),
 keep static buffer pages pinned until replacement or destruction,
 cap streaming ADPCM SSL entries to the hardware sample-count
-limit, reject truncated SSL tables, return playback offsets in bytes, embed
+limit, reject truncated SSL tables, return playback offsets in bytes, count
+static-buffer end and current offsets in samples (64 per ADPCM block, as SSL
+lengths and xemu's voice processor do), embed
 the DSP text on Clang 18, and avoid a `fabsf` dependency that pulls a duplicate
 Halo/nxdk CRT `fabs` symbol into the link. Source license headers are preserved:
 upstream code is MIT, and the HRTF table carries CC BY 4.0 attribution in
@@ -125,7 +127,8 @@ python3 tools/audio_status.py build-apu/halo.map --host 127.0.0.1
 
 The linked x86 tests simulate driver events and kernel boundaries. They check
 four-packet/two-slot ownership, coalesced completions, completion before Process,
-thread-only game callbacks, pause/gain/pitch, ADPCM staging, stop timeout safety,
+thread-only game callbacks, pause/gain/absolute XDK pitch, ADPCM staging and
+sample-unit loop regions, stop timeout safety,
 32 channel reuse cycles using Halo's actual callback/cache-reference functions,
 static buffer play/loop/seek/stop/replay, and descriptor retirement/static-page
 pinning with the actual compiled driver DPC. The retirement assertion fails

@@ -1,11 +1,11 @@
 /*
  * Standalone compat: Direct3D 8 (Xbox) device and resource layer.
  *
- * Stage 1 of the D3D8 replacement: a device that honors the Xbox resource
- * conventions the game (and the D3D routines already lifted into
- * src/halo/rasterizer/xbox/d3d_resource.c) depend on, but does not render
- * yet. Draw calls stay generated no-op stubs until the pbkit backend lands;
- * render and texture states are pushed by d3d8_state.c.
+ * A pbkit-backed device that honors the Xbox resource conventions the game
+ * (and the D3D routines already lifted into
+ * src/halo/rasterizer/xbox/d3d_resource.c) depend on: creation, targets,
+ * Clear, Present and the vblank thread. Render and texture states are pushed
+ * by state.c, shaders, streams and draw calls by draw.c.
  *
  * Xbox resource headers (all little-endian dwords):
  *   +0x00 Common  refcount (bits 0-15) | type (bits 16-18) | flags
@@ -19,18 +19,11 @@
  * allocation to free; the game also builds headers of its own
  * (rasterizer_xbox.c), which D3D_DestroyResource must leave alone.
  */
-#include "nv_regs.h"
-#include "xbox.h"
+#include "internal.h"
 
-/* nxdk pdclib. decl.h carries kb placeholders for some of these names, so
- * bind compat-local names to the pdclib symbols. */
-void *__cdecl compat_malloc(size_t size) __asm__("_malloc");
 void *__cdecl compat_calloc(size_t count, size_t size) __asm__("_calloc");
-void __cdecl compat_free(void *memory) __asm__("_free");
 void *__cdecl compat_memset(void *dst, int value,
                             size_t size) __asm__("_memset");
-void *__cdecl compat_memcpy(void *dst, const void *src,
-                            size_t size) __asm__("_memcpy");
 void XVideoWaitForVBlank(void);
 int XVideoSetMode(int width, int height, int bpp, int refresh);
 unsigned char *XVideoGetFB(void);
@@ -38,14 +31,10 @@ void XVideoSetFB(unsigned char *fb);
 void XVideoFlushFB(void);
 void XVideoSetVideoEnable(int enable);
 int pb_init(void);
-void halo_standalone_missing(const char *name);
 unsigned long pb_wait_for_vbl(void);
-void pb_reset(void);
 void pb_wait_until_gr_not_busy(void);
 void pb_size(unsigned long size);
 void pb_set_surface_allocation(int enable);
-uint32_t *pb_begin(void);
-void pb_end(uint32_t *end);
 uint32_t *pb_push1(uint32_t *p, unsigned long command, unsigned long param1);
 uint32_t *pb_push2(uint32_t *p, unsigned long command, unsigned long param1,
                    unsigned long param2);
@@ -59,15 +48,10 @@ int __cdecl
 compat_SetThreadPriority(void *thread,
                          int priority) __asm__("_SetThreadPriority");
 
-#define D3D_OK 0
-#define E_OUTOFMEMORY 0x8007000e
-
-#define D3DCOMMON_TYPE_MASK 0x00070000
 #define D3DCOMMON_TYPE_VERTEXBUFFER 0x00000000
 #define D3DCOMMON_TYPE_INDEXBUFFER 0x00010000
 #define D3DCOMMON_TYPE_PALETTE 0x00030000
 #define D3DCOMMON_TYPE_TEXTURE 0x00040000
-#define D3DCOMMON_TYPE_SURFACE 0x00050000
 #define D3DCOMMON_VIDEOMEMORY 0x00800000
 #define D3DCOMMON_D3DCREATED 0x01000000
 
@@ -89,7 +73,6 @@ compat_SetThreadPriority(void *thread,
 
 #define D3DFMT_LIN_A8R8G8B8 0x12
 #define D3DFMT_LIN_D24S8 0x2e
-#define D3DFMT_LIN_F24S8 0x2f
 #define D3DFMT_DXT1 0x0c
 #define D3DFMT_DXT2 0x0e
 #define D3DFMT_DXT4 0x0f
@@ -100,10 +83,17 @@ compat_SetThreadPriority(void *thread,
 #define D3DRTYPE_VOLUMETEXTURE 4
 #define D3DRTYPE_CUBETEXTURE 5
 
-#define D3DTS_COUNT 10
+#define D3DTS_MATRIX_BYTES 0x40
+/* 0x1f9de0, by D3DTS type: view (it also moves the lights), projection,
+ * texture 0-3, world 0-3. */
+static const unsigned long transform_dirty_bits[D3DTS_COUNT] = {
+  DIRTY_TRANSFORMS | DIRTY_LIGHTING, DIRTY_TRANSFORMS,
+  DIRTY_TEXTURE_TRANSFORM, DIRTY_TEXTURE_TRANSFORM,
+  DIRTY_TEXTURE_TRANSFORM, DIRTY_TEXTURE_TRANSFORM,
+  DIRTY_TRANSFORMS, DIRTY_TRANSFORMS, DIRTY_TRANSFORMS, DIRTY_TRANSFORMS,
+};
 #define D3DTS_PROJECTION 1
 #define DEVICE_TRANSFORM_BASE 0x880
-#define DEVICE_DERIVED_PROJECTION_MATRIX 0x5a0
 #define TEXTURE_ALIGNMENT 0x1000
 #define CUBEFACE_ALIGNMENT 0x80
 #define COMPAT_RESOURCE_COOKIE 0x48434f4d /* 'HCOM' */
@@ -116,33 +106,23 @@ compat_SetThreadPriority(void *thread,
  * flip-count fields at those fixed addresses instead of through the pointer.
  * The 2276 D3D offsets: the callback at +0x24ec from
  * D3DDevice_SetVerticalBlankCallback (0x1e70e0), the flip count at +0x2518
- * that the vblank path copies from the swap count at +0x2b60 (0x1ef9c9),
- * and Present's wait while swap - flip >= 2 (0x1ee931). */
-#define DEVICE_ADDRESS 0x1fbb10
+ * that the vblank path copies from the swap count at +0x2b60 (0x1ef9c9). */
 #define DEVICE_SIZE 0x2b90
 #define DEVICE_INTERRUPTS_ENABLED 0x23ac
 #define DEVICE_VBLANK_CALLBACK 0x24ec
 #define DEVICE_FLIP_COUNT 0x2518
 #define DEVICE_SWAP_COUNT 0x2b60
-#define PRESENT_MAX_PENDING_FLIPS 2
+#define D3DPRESENT_INTERVAL_IMMEDIATE 0x80000000ul
 #define THREAD_PRIORITY_TIME_CRITICAL_VALUE 15
-#define DEVICE_STATE_FLAGS 0x0c
-#define DEVICE_CURRENT_TIME 0x1c
 #define DEVICE_COMPLETED_TIME_POINTER 0x3f0
 /* Reference count: D3DDevice_Release (0x1e6f50) decrements it and tears the
  * device down when the last reference goes. */
 #define DEVICE_REFERENCE_COUNT 0x408
-#define DEVICE_RENDER_TARGET_SURFACE 0x40c
-#define DEVICE_DEPTH_STENCIL_SURFACE 0x410
+#define DEVICE_RENDER_TARGET 0x40c
+#define DEVICE_DEPTH_STENCIL 0x410
 #define DEVICE_PROJECTION_DEPTH_OFFSET 0x4ec
 #define DEVICE_PROJECTION_DEPTH_SCALE 0x4f0
-#define DEVICE_Z_SCALE_W 0x4f4
-#define DEVICE_Z_SCALE 0x4f8
-#define DEVICE_SUPER_SAMPLE_SCALE_X 0x500
-#define DEVICE_SUPER_SAMPLE_SCALE_Y 0x504
 #define DEVICE_PROJECTION_MATRIX 0x8c0
-#define DEVICE_VIEWPORT 0xb00
-#define DEVICE_BUFFER_SURFACES 0x2150
 #define DEVICE_BUFFER_SURFACE_COUNT 3
 #define DEVICE_BUFFER_SURFACE_STRIDE 0x18
 #define DEVICE_BACK_BUFFER_SLOT 0
@@ -158,13 +138,9 @@ compat_SetThreadPriority(void *thread,
 #define D3DCLEAR_TARGET_B 0x40
 #define D3DCLEAR_TARGET_A 0x80
 
-#define SURFACE_SIZE_DIMENSION_MASK 0xfff
-#define SURFACE_SIZE_HEIGHT_SHIFT 12
-#define SURFACE_SIZE_PITCH_SHIFT 24
-#define SURFACE_PITCH_UNIT 64
+#define DEPTH_D16_MAX 0xffff
 #define DEPTH_D24_MAX 0xffffff
 #define DEPTH_STENCIL_SHIFT 8
-#define DEPTH_F24_MANTISSA_DROP 7
 
 /* pbkit's DMA object 3: 3D class over all of RAM (pb_init). Binding it as the
  * color and zeta context makes surface offsets physical addresses, as in the
@@ -234,35 +210,21 @@ static const unsigned long d3d_device_caps[0x35] = {
 };
 
 static unsigned char d3d_object;
-#define d3d_device ((unsigned long *)DEVICE_ADDRESS)
 static void *d3d_vblank_thread;
 static unsigned long d3d_vblank_count;
 static unsigned long d3d_completed_time;
-static float d3d_transforms[D3DTS_COUNT][16];
 static unsigned long *d3d_render_target;
 static unsigned long *d3d_depth_stencil;
 static unsigned char *d3d_idle_framebuffer;
 static void *d3d_visibility_report_pages[16];
 static int d3d_pbkit_ready;
 static int d3d_targets_dirty;
+static int d3d_present_immediate;
 
-void compat_d3d_state_initialize(void);
-void compat_d3d_draw_initialize(void);
-void compat_d3d_push_passthrough_program(void);
-void compat_d3d_trace_mark(const char *what);
-unsigned long compat_d3d_push_buffer_bytes(void);
-void compat_d3d_push_rewind(void);
-void compat_d3d_set_depth_scale(const void *depth_stencil);
-
-/* d3d8_state.c pushes only once pbkit is up. */
+/* state.c pushes only once pbkit is up. */
 int compat_d3d_pbkit_ready(void)
 {
   return d3d_pbkit_ready;
-}
-
-static unsigned long *device_field(unsigned long offset)
-{
-  return (unsigned long *)((unsigned char *)d3d_device + offset);
 }
 
 /* The device is created (rasterizer_preinitialize) before
@@ -621,24 +583,63 @@ static void surface_fill(const unsigned long *surface, const d3d_rect *rect,
   }
 }
 
+static unsigned long saturate_depth(float scaled, unsigned long max)
+{
+  if (!(scaled > 0.0f)) {
+    return 0;
+  }
+  return scaled < (float)max ? (unsigned long)scaled : max;
+}
+
+/* The high word of the double z * scale: sign, 11-bit exponent and the top
+ * 20 mantissa bits. */
+static unsigned long float_depth_word(float z, double scale)
+{
+  double scaled = z * scale;
+  unsigned long words[2];
+
+  compat_memcpy(words, &scaled, sizeof(words));
+  return words[1];
+}
+
+/* 0x1ea735..0x1ea81c, 0x1ea95c: the zeta word as the format stores it. The
+ * float formats rebias the double's exponent to 8 bits over a 16-bit
+ * mantissa (F24) or 4 bits over 12 (F16), with z = 0 kept as 0. */
 static unsigned long depth_clear_value(const unsigned long *surface, float z,
                                        unsigned long stencil)
 {
   unsigned long depth;
 
-  if (((surface[3] >> D3DFORMAT_FORMAT_SHIFT) & 0xff) == D3DFMT_LIN_F24S8) {
-    /* NV2A float depth: IEEE single without sign and low 7 mantissa bits. */
-    compat_memcpy(&depth, &z, sizeof(depth));
-    depth = (depth >> DEPTH_F24_MANTISSA_DROP) & DEPTH_D24_MAX;
-  } else {
-    depth = (unsigned long)(z * (float)DEPTH_D24_MAX);
+  switch ((surface[3] >> D3DFORMAT_FORMAT_SHIFT) & 0xff) {
+  case 0x2a: /* D3DFMT_D24S8 */
+  case 0x2e: /* D3DFMT_LIN_D24S8 */
+    depth = saturate_depth(z * (float)DEPTH_D24_MAX, DEPTH_D24_MAX)
+            << DEPTH_STENCIL_SHIFT;
+    break;
+  case 0x2b: /* D3DFMT_F24S8 */
+  case 0x2f: /* D3DFMT_LIN_F24S8 */
+    depth = z == 0.0f ? 0 :
+            ((float_depth_word(z, 1e30) - 0x08000000ul) & 0xfffffff0ul) << 4;
+    break;
+  case 0x2c: /* D3DFMT_D16 */
+  case 0x30: /* D3DFMT_LIN_D16 */
+    depth = saturate_depth(z * (float)DEPTH_D16_MAX, DEPTH_D16_MAX);
+    break;
+  case 0x2d: /* D3DFMT_F16 */
+  case 0x31: /* D3DFMT_LIN_F16 */
+    depth = z == 0.0f ? 0 :
+            ((float_depth_word(z, 511.9375) >> 8) - 0x8000) & 0xffff;
+    break;
+  default:
+    depth = 0;
+    break;
   }
-  return (depth << DEPTH_STENCIL_SHIFT) | (stencil & 0xff);
+  return depth | stencil;
 }
 
 /* 0x1e7b0b..0x1e7b5d: a linear surface carries its dimensions in Size; a
  * swizzled one (Size 0) carries log2 width/height in Format. */
-static unsigned long surface_width(const unsigned long *surface)
+unsigned long compat_d3d_surface_width(const unsigned long *surface)
 {
   if (surface[4] == 0) {
     return 1ul << ((surface[3] >> D3DFORMAT_USIZE_SHIFT) & 0xf);
@@ -646,7 +647,7 @@ static unsigned long surface_width(const unsigned long *surface)
   return (surface[4] & SURFACE_SIZE_DIMENSION_MASK) + 1;
 }
 
-static unsigned long surface_height(const unsigned long *surface)
+unsigned long compat_d3d_surface_height(const unsigned long *surface)
 {
   if (surface[4] == 0) {
     return 1ul << ((surface[3] >> D3DFORMAT_VSIZE_SHIFT) & 0xf);
@@ -660,7 +661,7 @@ static unsigned long surface_height(const unsigned long *surface)
 static unsigned long surface_pitch(const unsigned long *surface)
 {
   if (surface[4] == 0) {
-    return surface_width(surface) *
+    return compat_d3d_surface_width(surface) *
            format_bits_per_pixel((surface[3] >> D3DFORMAT_FORMAT_SHIFT) &
                                  0xff) /
            8;
@@ -773,12 +774,12 @@ static void gpu_bind_targets(void)
 
   color = d3d_render_target;
   zeta = d3d_depth_stencil;
-  width = surface_width(color);
-  height = surface_height(color);
+  width = compat_d3d_surface_width(color);
+  height = compat_d3d_surface_height(color);
   format = surface_format(color, zeta);
   zeta_pitch = zeta ? surface_pitch(zeta) : surface_pitch(color);
 
-  p = pb_begin();
+  p = compat_d3d_push_reserve(16);
   p = pb_push1(p, NV097_SET_CONTEXT_DMA_COLOR, PBKIT_DMA_ALL_RAM);
   p = pb_push1(p, NV097_SET_CONTEXT_DMA_ZETA, PBKIT_DMA_ALL_RAM);
   p = pb_push1(p, NV097_SET_SURFACE_FORMAT, format);
@@ -788,7 +789,7 @@ static void gpu_bind_targets(void)
   p = pb_push1(p, NV097_SET_SURFACE_CLIP_VERTICAL, height << 16);
   p = pb_push1(p, NV097_SET_SURFACE_COLOR_OFFSET, color[1]);
   p = pb_push1(p, NV097_SET_SURFACE_ZETA_OFFSET, zeta ? zeta[1] : 0);
-  pb_end(p);
+  compat_d3d_push_end(p);
   d3d_targets_dirty = 0;
 }
 
@@ -805,8 +806,8 @@ static void gpu_clear(const d3d_rect *rect, unsigned long flags,
   uint32_t *p;
 
   target = d3d_render_target;
-  width = (long)surface_width(target);
-  height = (long)surface_height(target);
+  width = (long)compat_d3d_surface_width(target);
+  height = (long)compat_d3d_surface_height(target);
   x1 = 0;
   y1 = 0;
   x2 = width;
@@ -820,7 +821,7 @@ static void gpu_clear(const d3d_rect *rect, unsigned long flags,
   if (x2 <= x1 || y2 <= y1) {
     return;
   }
-  p = pb_begin();
+  p = compat_d3d_push_reserve(8);
   p = pb_push2(
     p, NV097_SET_CLEAR_RECT_HORIZONTAL,
     ((unsigned long)(x2 - 1) << NV097_CLEAR_RECT_SHIFT) | (unsigned long)x1,
@@ -828,7 +829,7 @@ static void gpu_clear(const d3d_rect *rect, unsigned long flags,
   p = pb_push2(p, NV097_SET_ZSTENCIL_CLEAR_VALUE, depth, color);
   /* NV097_CLEAR_SURFACE takes the Xbox D3DCLEAR bits as they are. */
   p = pb_push1(p, NV097_CLEAR_SURFACE, flags);
-  pb_end(p);
+  compat_d3d_push_end(p);
 }
 
 void *__stdcall Direct3DCreate8(uint32_t sdk_version)
@@ -899,8 +900,10 @@ int __stdcall Direct3D_CreateDevice(uint32_t adapter, uint32_t device_type,
   pp = (const d3d_present_parameters *)present_parameters;
   width = pp->back_buffer_width ? pp->back_buffer_width : 640;
   height = pp->back_buffer_height ? pp->back_buffer_height : 480;
+  d3d_present_immediate =
+    pp->presentation_interval == D3DPRESENT_INTERVAL_IMMEDIATE;
 
-  compat_memset(d3d_device, 0, DEVICE_SIZE);
+  compat_memset(D3D_DEVICE, 0, DEVICE_SIZE);
   *device_field(DEVICE_INTERRUPTS_ENABLED) = 1;
   *device_field(DEVICE_REFERENCE_COUNT) = 1;
   *device_field(DEVICE_COMPLETED_TIME_POINTER) =
@@ -929,16 +932,11 @@ int __stdcall Direct3D_CreateDevice(uint32_t adapter, uint32_t device_type,
       *out_device = 0;
       return E_OUTOFMEMORY;
     }
-    *device_field(DEVICE_DEPTH_STENCIL_SURFACE) = (unsigned long)depth;
-  }
-  for (i = 0; i < D3DTS_COUNT; i++) {
-    compat_memset(d3d_transforms[i], 0, sizeof(d3d_transforms[i]));
-    d3d_transforms[i][0] = d3d_transforms[i][5] = 1.0f;
-    d3d_transforms[i][10] = d3d_transforms[i][15] = 1.0f;
+    *device_field(DEVICE_DEPTH_STENCIL) = (unsigned long)depth;
   }
   d3d_render_target = buffer_surface(DEVICE_BACK_BUFFER_SLOT);
   d3d_depth_stencil =
-    (unsigned long *)*device_field(DEVICE_DEPTH_STENCIL_SURFACE);
+    (unsigned long *)*device_field(DEVICE_DEPTH_STENCIL);
   d3d_targets_dirty = 1;
   d3d_idle_framebuffer = 0;
   if (XVideoSetMode((int)width, (int)height, VIDEO_BITS_PER_PIXEL,
@@ -950,7 +948,7 @@ int __stdcall Direct3D_CreateDevice(uint32_t adapter, uint32_t device_type,
   }
   if (!d3d_pbkit_ready) {
     /* Halo asks the XDK for a 768KB push buffer (D3D_SetPushBufferSize);
-     * pbkit does not wrap, so it gets a larger one (d3d8_draw.c). */
+     * pbkit does not wrap, so it gets a larger one (draw.c). */
     pb_size(compat_d3d_push_buffer_bytes());
     /* The device renders into and scans out its own surfaces above, as the
      * XDK does; pbkit's triple frame buffers and depth buffer (~4.7MB of
@@ -962,8 +960,8 @@ int __stdcall Direct3D_CreateDevice(uint32_t adapter, uint32_t device_type,
       compat_d3d_push_rewind();
     }
   }
-  D3D_g_pDevice = (uint8_t *)d3d_device;
-  *device_field(DEVICE_RENDER_TARGET_SURFACE) =
+  D3D_g_pDevice = (uint8_t *)D3D_DEVICE;
+  *device_field(DEVICE_RENDER_TARGET) =
     (unsigned long)d3d_render_target;
   compat_d3d_state_initialize();
   compat_d3d_set_depth_scale(d3d_depth_stencil);
@@ -986,7 +984,7 @@ int __stdcall Direct3D_CreateDevice(uint32_t adapter, uint32_t device_type,
     compat_SetThreadPriority(d3d_vblank_thread,
                              THREAD_PRIORITY_TIME_CRITICAL_VALUE);
   }
-  *out_device = d3d_device;
+  *out_device = D3D_DEVICE;
   return D3D_OK;
 }
 
@@ -1017,7 +1015,7 @@ int __stdcall D3DDevice_GetDepthStencilSurface(void **out_surface)
 {
   unsigned long *surface;
 
-  surface = (unsigned long *)*device_field(DEVICE_DEPTH_STENCIL_SURFACE);
+  surface = (unsigned long *)*device_field(DEVICE_DEPTH_STENCIL);
   *out_surface = surface;
   if (!surface) {
     return 0x88760827; /* D3DERR_NOTFOUND */
@@ -1311,33 +1309,14 @@ void D3DDevice_Release(void)
       MmFreeContiguousMemory(video_address(surface[1]));
     }
   }
-  surface = (unsigned long *)*device_field(DEVICE_DEPTH_STENCIL_SURFACE);
+  surface = (unsigned long *)*device_field(DEVICE_DEPTH_STENCIL);
   if (surface) {
     D3D_DestroyResource(surface);
   }
   d3d_render_target = 0;
   d3d_depth_stencil = 0;
   D3D_g_pDevice = 0;
-  compat_memset(d3d_device, 0, DEVICE_SIZE);
-}
-
-static void matrix4x4_multiply(float *out, const float *left,
-                               const float *right)
-{
-  float result[16];
-  int row;
-  int column;
-  int i;
-
-  for (row = 0; row < 4; row++) {
-    for (column = 0; column < 4; column++) {
-      result[row * 4 + column] = 0.0f;
-      for (i = 0; i < 4; i++) {
-        result[row * 4 + column] += left[row * 4 + i] * right[i * 4 + column];
-      }
-    }
-  }
-  compat_memcpy(out, result, sizeof(result));
+  compat_memset(D3D_DEVICE, 0, DEVICE_SIZE);
 }
 
 /* 0x1f02d0: build the viewport/depth adjustment matrix and pre-multiply the
@@ -1377,10 +1356,10 @@ void D3D_UpdateProjectionViewportTransform(void)
   adjustment[13] = -height;
   adjustment[14] = depth_offset;
   adjustment[15] = w_scale;
-  matrix4x4_multiply((float *)device_field(DEVICE_DERIVED_PROJECTION_MATRIX),
+  compat_d3d_matrix4x4_multiply((float *)device_field(DEVICE_DERIVED_PROJECTION_MATRIX),
                      (const float *)device_field(DEVICE_PROJECTION_MATRIX),
                      adjustment);
-  *device_field(8) |= 2;
+  *device_field(DEVICE_DIRTY) |= DIRTY_TRANSFORMS;
 }
 
 void __stdcall D3DDevice_SetTransform(uint32_t type, void *matrix)
@@ -1389,9 +1368,9 @@ void __stdcall D3DDevice_SetTransform(uint32_t type, void *matrix)
   float depth_scale;
 
   if (type < D3DTS_COUNT) {
-    compat_memcpy(d3d_transforms[type], matrix, sizeof(d3d_transforms[type]));
-    compat_memcpy(device_field(DEVICE_TRANSFORM_BASE + type * 0x40), matrix,
-                  sizeof(d3d_transforms[type]));
+    compat_memcpy(device_field(DEVICE_TRANSFORM_BASE + type * D3DTS_MATRIX_BYTES),
+                  matrix, D3DTS_MATRIX_BYTES);
+    *device_field(DEVICE_DIRTY) |= transform_dirty_bits[type];
     if (type == D3DTS_PROJECTION) {
       m = (const float *)matrix;
       if (m[10] == m[11] || m[10] == 0.0f) {
@@ -1419,12 +1398,13 @@ void __stdcall D3DDevice_SetTransform(uint32_t type, void *matrix)
 void __stdcall D3DDevice_GetTransform(uint32_t type, void *matrix_out)
 {
   if (type < D3DTS_COUNT) {
-    compat_memcpy(matrix_out, d3d_transforms[type],
-                  sizeof(d3d_transforms[type]));
+    compat_memcpy(matrix_out,
+                  device_field(DEVICE_TRANSFORM_BASE + type * D3DTS_MATRIX_BYTES),
+                  D3DTS_MATRIX_BYTES);
   }
 }
 
-/* Vertex shaders: d3d8_draw.c. */
+/* Vertex shaders: draw.c. */
 
 #define D3DERR_VISIBILITY_PENDING 0x88760828
 #define VISIBILITY_REPORT_PAGE_SIZE 0x1000
@@ -1463,11 +1443,11 @@ void D3DDevice_BeginVisibilityTest(void)
 {
   uint32_t *p;
 
-  p = pb_begin();
+  p = compat_d3d_push_reserve(4);
   p = pb_push1(p, NV097_CLEAR_REPORT_VALUE,
                NV097_CLEAR_REPORT_VALUE_TYPE_ZPASS_PIXEL_CNT);
   p = pb_push1(p, NV097_SET_ZPASS_PIXEL_COUNT_ENABLE, 1);
-  pb_end(p);
+  compat_d3d_push_end(p);
 }
 
 int __stdcall D3DDevice_EndVisibilityTest(unsigned int index)
@@ -1488,11 +1468,11 @@ int __stdcall D3DDevice_EndVisibilityTest(unsigned int index)
                        VISIBILITY_REPORT_STATUS_OFFSET) = 0xffffffff;
   }
   report_offset = MmGetPhysicalAddress(report) & NV097_GET_REPORT_OFFSET;
-  p = pb_begin();
+  p = compat_d3d_push_reserve(4);
   p = pb_push1(p, NV097_SET_ZPASS_PIXEL_COUNT_ENABLE, 0);
   p = pb_push1(p, NV097_GET_REPORT,
                report_offset | (NV097_GET_REPORT_TYPE_ZPASS_PIXEL_CNT << 24));
-  pb_end(p);
+  compat_d3d_push_end(p);
   return D3D_OK;
 }
 
@@ -1523,7 +1503,14 @@ int __stdcall D3DDevice_GetVisibilityTestResult(unsigned int index,
 
 /* The back and front buffer headers keep their slots (the game holds the back
  * buffer as its render target); their bits trade places and the new front is
- * scanned out. */
+ * scanned out.
+ *
+ * The scanout address latches at the next vblank, and the device has a
+ * single back buffer: until then the new back buffer is still on screen. The
+ * XDK (0x1ee931) lets the CPU run two swaps ahead because its GPU waits for
+ * the flip before rendering; this one renders immediately, so it returns only
+ * once the vblank thread has seen the flip, unless the game asked for
+ * D3DPRESENT_INTERVAL_IMMEDIATE (tearing allowed). */
 void __stdcall D3DDevice_Present(void *source_rect, void *dest_rect,
                                  void *window_override, void *dirty_region)
 {
@@ -1550,8 +1537,8 @@ void __stdcall D3DDevice_Present(void *source_rect, void *dest_rect,
   d3d_targets_dirty = 1;
   XVideoSetFB((unsigned char *)bits);
   (*device_field(DEVICE_SWAP_COUNT))++;
-  while (*device_field(DEVICE_SWAP_COUNT) - *device_field(DEVICE_FLIP_COUNT) >=
-         PRESENT_MAX_PENDING_FLIPS) {
+  while (!d3d_present_immediate &&
+         *device_field(DEVICE_SWAP_COUNT) != *device_field(DEVICE_FLIP_COUNT)) {
     wait_for_vblank();
   }
 }
@@ -1624,10 +1611,6 @@ void __stdcall matrix_build_ortho_projection(void *matrix_out, float scale_x,
   m[15] = 1.0f;
 }
 
-#define D3D_RENDER_STATE ((unsigned long *)0x1fb698)
-#define D3DRS_ZENABLE 0x7b
-#define D3DRS_STENCILENABLE 0x7c
-
 /* Reference counts of the targets are not adjusted yet. A NULL render
  * target keeps the current one; a NULL depth buffer disables it. */
 void __stdcall D3DDevice_SetRenderTarget(void *render_target,
@@ -1642,9 +1625,9 @@ void __stdcall D3DDevice_SetRenderTarget(void *render_target,
   d3d_targets_dirty = 1;
   /* The XDK keeps the current targets at device+0x40c/+0x410 (0x1e7bda,
    * 0x1e7bff); the render-state setters read them there. */
-  *device_field(DEVICE_RENDER_TARGET_SURFACE) =
+  *device_field(DEVICE_RENDER_TARGET) =
     (unsigned long)d3d_render_target;
-  *device_field(DEVICE_DEPTH_STENCIL_SURFACE) =
+  *device_field(DEVICE_DEPTH_STENCIL) =
     (unsigned long)d3d_depth_stencil;
   compat_d3d_set_depth_scale(d3d_depth_stencil);
   /* 0x1e7c1a..0x1e7cc2: the surface is programmed here, not at the next
@@ -1653,12 +1636,12 @@ void __stdcall D3DDevice_SetRenderTarget(void *render_target,
    * re-gated on the new depth buffer (0x1fb884 / 0x1fb888 && zeta). */
   if (d3d_pbkit_ready && d3d_render_target) {
     gpu_bind_targets();
-    p = pb_begin();
+    p = compat_d3d_push_reserve(4);
     p = pb_push1(p, NV097_SET_DEPTH_TEST_ENABLE,
                  (D3D_RENDER_STATE[D3DRS_ZENABLE] && d3d_depth_stencil) ? 1 : 0);
     p = pb_push1(p, NV097_SET_STENCIL_TEST_ENABLE,
                  (D3D_RENDER_STATE[D3DRS_STENCILENABLE] && d3d_depth_stencil) ? 1 : 0);
-    pb_end(p);
+    compat_d3d_push_end(p);
   }
 }
 
@@ -1706,14 +1689,14 @@ void __stdcall D3DDevice_Clear(uint32_t count, void *rects, uint32_t flags,
       swizzled_format = 0;
     }
     if (swizzled_format) {
-      p = pb_begin();
+      p = compat_d3d_push_reserve(2);
       p = pb_push1(p, NV097_SET_SURFACE_FORMAT,
                    (swizzled_format &
                     ~(NV097_SET_SURFACE_FORMAT_TYPE_SWIZZLE
                       << SURFACE_FORMAT_TYPE_SHIFT)) |
                      (NV097_SET_SURFACE_FORMAT_TYPE_PITCH
                       << SURFACE_FORMAT_TYPE_SHIFT));
-      pb_end(p);
+      compat_d3d_push_end(p);
     }
     if (!d3d_depth_stencil) {
       flags &= ~(uint32_t)(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL);
@@ -1722,9 +1705,9 @@ void __stdcall D3DDevice_Clear(uint32_t count, void *rects, uint32_t flags,
       gpu_clear(count ? &rect[i] : 0, flags, color, depth);
     }
     if (swizzled_format) {
-      p = pb_begin();
+      p = compat_d3d_push_reserve(2);
       p = pb_push1(p, NV097_SET_SURFACE_FORMAT, swizzled_format);
-      pb_end(p);
+      compat_d3d_push_end(p);
     }
     return;
   }

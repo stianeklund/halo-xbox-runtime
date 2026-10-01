@@ -34,6 +34,13 @@ set_property(SOURCE nxdk_keyboard.c ${USB_HID_SOURCES} APPEND PROPERTY COMPILE_O
 	"-DUSBH_USE_EXTERNAL_CONFIG=\"usbh_config_xbox.h\""
 	"-Dsysprintf=standalone_hid_log" "-Dget_ticks=usbh_get_ticks")
 set_target_properties(standalone_crt PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+# Our sources build warning-clean like the game's; nxdk's HID and nxdk-audio
+# sources, and pdclib_open.c (which includes nxdk's _PDCLIB_open.c), are
+# compiled as they come.
+set(CRT_OWN_SOURCES msvc_print.c nxdk_net.c nxdk_debug_net.c nxdk_xnet.c
+	../compat/xnet/xnet.c ../compat/xnet/security.c nxdk_keyboard.c
+	../compat/audio/mixer.c nxdk_audio_apu.c nxdk_audio.c)
+set_property(SOURCE ${CRT_OWN_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -Wall -Werror)
 target_include_directories(standalone_crt BEFORE PRIVATE
 	"${NXDK_DIR}/lib/pdclib"
 	"${NXDK_DIR}/lib"

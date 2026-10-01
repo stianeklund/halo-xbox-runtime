@@ -12,6 +12,11 @@
 #define RAD_ALLOCATION_OVERHEAD 64
 #define RAD_ALLOCATOR_STANDARD 0
 #define RAD_ALLOCATOR_CALLBACK 3
+/* Each pushed size and the running total stay below 1 GiB, so neither the
+ * rounding nor the sums can wrap; PENDING_ALLOCATION_OVERFLOW marks a
+ * pushmalloc that would have. */
+#define PENDING_ALLOCATION_LIMIT 0x40000000ul
+#define PENDING_ALLOCATION_OVERFLOW 0xfffffffful
 
 typedef void *(__stdcall *rad_malloc_proc)(unsigned long);
 typedef void(__stdcall *rad_free_proc)(void *);
@@ -46,7 +51,7 @@ void *__stdcall FUN_002314b0(unsigned long size)
   unsigned char adjustment;
   unsigned char *prefix;
 
-  if (!size || size == 0xfffffffful) {
+  if (!size || size > 0xfffffffful - RAD_ALLOCATION_OVERHEAD) {
     return 0;
   }
   if (rad_allocate_callback) {
@@ -92,12 +97,18 @@ void __stdcall FUN_00231520(void *allocation)
 }
 
 /* 0x22de60. pushmalloc: queue a sub-allocation of the next popmalloc block;
- * starts are spread over 32-byte cache-line slots. */
+ * starts are spread over 32-byte cache-line slots. Not in the original: a
+ * total that would overflow (sizes come from the file header) saturates, so
+ * the popmalloc fails instead of handing out an undersized block. */
 void __stdcall FUN_0022de60(void **destination, unsigned long size)
 {
   unsigned long cache_lines = pending_allocation_bytes / 32;
 
   if (pending_allocation_count >= 128) {
+    return;
+  }
+  if (size > PENDING_ALLOCATION_LIMIT || pending_allocation_bytes > PENDING_ALLOCATION_LIMIT) {
+    pending_allocation_bytes = PENDING_ALLOCATION_OVERFLOW;
     return;
   }
   size = (size + 15) & ~15ul;
@@ -115,8 +126,12 @@ void *__stdcall FUN_0022dec0(unsigned long size)
   unsigned char *allocation;
   unsigned long i;
 
-  size = (size + 15) & ~15ul;
-  allocation = FUN_002314b0(pending_allocation_bytes + size);
+  if (size > PENDING_ALLOCATION_LIMIT || pending_allocation_bytes > PENDING_ALLOCATION_LIMIT) {
+    allocation = 0;
+  } else {
+    size = (size + 15) & ~15ul;
+    allocation = FUN_002314b0(pending_allocation_bytes + size);
+  }
   pending_allocation_bytes = 0;
   if (allocation) {
     unsigned char *next = allocation + size;

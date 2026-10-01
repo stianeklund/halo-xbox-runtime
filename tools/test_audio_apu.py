@@ -362,6 +362,41 @@ def test_static_buffer(build):
     image.release(buffer)
 
 
+def test_buffer_pitch_is_absolute(build):
+    # XDK pitch 4096 * log2(f / 48000) is independent of the buffer's rate.
+    image = ApuImage(build)
+    desc = image.alloc(struct.pack("<IIIIII", 24, 0, 8, image.format(rate=22050), 3, 0))
+    out = image.alloc(bytes(4))
+    assert image.call("_DirectSoundCreateBuffer@8", desc, out) == 0
+    buffer, = image.words(out)
+    data = image.alloc(pcm(100, -100, 200, -200))
+    assert image.call("_IDirectSoundBuffer_SetBufferData@12", buffer, data, 8) == 0
+    assert image.call("_IDirectSoundBuffer_Play@16", buffer, 0, 0, 1) == 0
+    hardware = image.hardware(buffer)
+    assert image.call("_IDirectSoundBuffer_SetPitch@8", buffer, -4096) == 0
+    assert abs(image.voices[hardware]["pitch"] - 24000 / 22050) < 1e-4
+    assert image.call("_IDirectSoundBuffer_SetPitch@8", buffer, -8773) == 0
+    image.release(buffer)
+
+
+def test_adpcm_loop_region_in_samples(build):
+    # LBO/EBO count samples for ADPCM too (64 per 36-byte mono block).
+    image = ApuImage(build)
+    desc = image.alloc(struct.pack("<IIIIII", 24, 0, 144,
+                                   image.format(rate=22050, adpcm=True), 3, 0))
+    out = image.alloc(bytes(4))
+    assert image.call("_DirectSoundCreateBuffer@8", desc, out) == 0
+    buffer, = image.words(out)
+    data = image.alloc(bytes(144))
+    assert image.call("_IDirectSoundBuffer_SetBufferData@12", buffer, data, 144) == 0
+    assert image.call("_IDirectSoundBuffer_Play@16", buffer, 0, 0, 1) == 0
+    lbo, ebo = 0xfe820000 + 0x3a4, 0xfe820000 + 0x3dc
+    assert image.words(lbo)[0] == 0 and image.words(ebo)[0] == 255
+    assert image.call("_IDirectSoundBuffer_SetLoopRegion@12", buffer, 36, 72) == 0
+    assert image.words(lbo)[0] == 64 and image.words(ebo)[0] == 191
+    image.release(buffer)
+
+
 def test_driver_descriptor_retirement_and_pinning(build):
     from unicorn import UC_HOOK_MEM_WRITE
     image = ApuImage(build)
@@ -662,7 +697,8 @@ if __name__ == "__main__":
                  test_reference_voice_headroom, test_pause_gain_pitch_and_adpcm, test_stop_timeout_retains_ownership,
                  test_stop_timeout_late_completion,
                  test_halo_channel_reuse, test_halo_channel_initialization, test_halo_spatial_gain,
-                 test_static_buffer, test_driver_descriptor_retirement_and_pinning,
+                 test_static_buffer, test_buffer_pitch_is_absolute, test_adpcm_loop_region_in_samples,
+                 test_driver_descriptor_retirement_and_pinning,
                  test_driver_pio_completion_interleaving,
                  test_driver_stream_fifo_and_publication, test_adapter_waits_for_stream_fifo_slot):
         test(build)

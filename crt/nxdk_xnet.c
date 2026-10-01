@@ -4,14 +4,18 @@
  */
 #include "../compat/xnet/security.h"
 #include "xnet_profile.h"
-#include <lwip/inet_chksum.h>
 #include <lwip/ip4.h>
+#include <lwip/prot/iana.h>
+#include <lwip/prot/ip.h>
 #include <lwip/tcpip.h>
 #include <lwip/timeouts.h>
 #include <netif/ethernet.h>
 #include <string.h>
 #include <windows.h>
 #include <xboxkrnl/xboxkrnl.h>
+
+#define XNET_PORT 3074 /* UDP port of every XNet wire packet */
+#define XNET_STARTUP_BYPASS_SECURITY 1
 
 static struct xsec security;
 static struct netif *interface;
@@ -87,7 +91,7 @@ static int wire_send(void *user, const uint8_t *mac, const uint8_t *data,
   frame[12] = 8;
   ip[0] = 0x45;
   ip[8] = 64;
-  ip[9] = 17;
+  ip[9] = IP_PROTO_UDP;
   ip[15] = 1;
   if (broadcast)
     memset(ip + 16, 255, 4);
@@ -95,11 +99,11 @@ static int wire_send(void *user, const uint8_t *mac, const uint8_t *data,
     ip[19] = 1;
   put16(ip + 2, 28 + n);
   put16(ip + 10, sum(ip, 20, 0));
-  put16(udp, 3074);
-  put16(udp + 2, 3074);
+  put16(udp, XNET_PORT);
+  put16(udp + 2, XNET_PORT);
   put16(udp + 4, 8 + n);
   memcpy(udp + 8, data, n);
-  put16(udp + 6, transport_sum(ip, udp, 8 + n, 17));
+  put16(udp + 6, transport_sum(ip, udp, 8 + n, IP_PROTO_UDP));
   if (!get16(udp + 6))
     put16(udp + 6, 65535);
   p = pbuf_alloc(PBUF_RAW, 14 + 28 + n, PBUF_RAM);
@@ -114,7 +118,7 @@ static void deliver(void *user, uint32_t source, uint8_t protocol,
                     const uint8_t *segment, unsigned n) {
   struct pbuf *p;
   uint8_t *ip, *body;
-  unsigned checksum_offset = protocol == 6 ? 16 : 6;
+  unsigned checksum_offset = protocol == IP_PROTO_TCP ? 16 : 6;
   uint16_t checksum;
   (void)user;
   p = pbuf_alloc(PBUF_RAW, 20 + n, PBUF_RAM);
@@ -155,8 +159,9 @@ static err_t secure_output(struct netif *netif, struct pbuf *p,
   unsigned header, n;
   uint16_t port = 0;
   int r, system_service = 0;
+  /* Without XNet the 0/8 route has no transport: never ARP for it in clear. */
   if (!security_refs)
-    return plain_output(netif, p, dest);
+    return netif == &secure_interface ? ERR_RTE : plain_output(netif, p, dest);
   if (p->tot_len > sizeof(data) ||
       pbuf_copy_partial(p, data, p->tot_len, 0) != p->tot_len)
     return ERR_BUF;
@@ -167,69 +172,71 @@ static err_t secure_output(struct netif *netif, struct pbuf *p,
     return ERR_VAL;
   segment = data + header;
   n -= header;
-  if (data[9] == 17 && n >= 8) {
+  if (data[9] == IP_PROTO_UDP && n >= 8) {
     port = get16(segment + 2);
-    system_service = port == 67 || port == 68 || port == 53;
+    system_service = port == LWIP_IANA_PORT_DHCP_SERVER ||
+                     port == LWIP_IANA_PORT_DHCP_CLIENT;
   }
   if (system_service ||
-      ((startup_flags & 1) && dest->addr != UINT32_MAX &&
+      ((startup_flags & XNET_STARTUP_BYPASS_SECURITY) &&
+       dest->addr != UINT32_MAX &&
        ((const uint8_t *)&dest->addr)[0] != 0))
     return plain_output(netif, p, dest);
   /* Only broadcasts and virtual addresses belong to the secure LAN. */
   if (dest->addr != UINT32_MAX && ((const uint8_t *)&dest->addr)[0] != 0)
     return ERR_RTE;
-  if (data[9] != 6 && data[9] != 17)
+  if (data[9] != IP_PROTO_TCP && data[9] != IP_PROTO_UDP)
     return ERR_RTE;
   r = xsec_send_segment(&security, dest->addr, data[9], segment, n);
   return !r ? ERR_OK : r == 10055 ? ERR_MEM : r == 10040 ? ERR_BUF : ERR_RTE;
 }
+/* Fails closed while XNet is up: a frame reaches lwIP only once classified.
+ * Virtual 0/8 peers exist only inside verified XNet packets, which
+ * xsec_receive delivers itself through the secure interface. */
 static err_t secure_ethernet_input(struct pbuf *p, struct netif *netif) {
-  uint8_t frame[14 + 1500], *ip = frame + 14, *udp;
-  unsigned header, total, n;
+  uint8_t frame[14 + 1500], *ip = frame + 14, *udp = NULL;
+  unsigned header, total, n = 0;
   int broadcast;
-  if (!security_refs || p->tot_len < 14 + 20 || p->tot_len > sizeof(frame) ||
+  if (!security_refs)
+    return ethernet_input(p, netif);
+  if (p->tot_len < 14 || p->tot_len > sizeof(frame) ||
       pbuf_copy_partial(p, frame, p->tot_len, 0) != p->tot_len)
+    goto drop;
+  if (get16(frame + 12) == ETHTYPE_ARP)
     return ethernet_input(p, netif);
-  if (get16(frame + 12) != 0x800 || (ip[0] >> 4) != 4)
-    return ethernet_input(p, netif);
+  if (get16(frame + 12) != ETHTYPE_IP || p->tot_len < 14 + 20 ||
+      (ip[0] >> 4) != 4)
+    goto drop;
   header = (ip[0] & 15) * 4;
   total = get16(ip + 2);
-  if (header < 20 || total < header || total > (unsigned)p->tot_len - 14) {
-    pbuf_free(p);
-    return ERR_OK;
+  if (header < 20 || total < header || total > (unsigned)p->tot_len - 14)
+    goto drop;
+  if (ip[9] == IP_PROTO_UDP && total >= header + 8) {
+    udp = ip + header;
+    n = total - header;
   }
-  if (ip[9] == 6 && !(startup_flags & 1)) {
-    pbuf_free(p);
-    return ERR_OK;
-  }
-  if (ip[9] != 17 || total < header + 8)
-    return ethernet_input(p, netif);
-  udp = ip + header;
-  n = total - header;
-  if (get16(udp) != 3074 || get16(udp + 2) != 3074) {
-    if (!(startup_flags & 1) && get16(udp) != 53 && get16(udp) != 67 &&
-        get16(udp) != 68) {
-      pbuf_free(p);
-      return ERR_OK;
-    }
-    return ethernet_input(p, netif);
-  }
-  broadcast = !memcmp(ip + 16, (const uint8_t[4]){255, 255, 255, 255}, 4);
-  if (!memcmp(ip + 12, (const uint8_t[4]){0, 0, 0, 1}, 4) &&
-      (broadcast || !memcmp(ip + 16, ip + 12, 4))) {
-    if (!(get16(ip + 6) & 0x3fff) && !sum(ip, header, 0) &&
+  if (udp && get16(udp) == XNET_PORT && get16(udp + 2) == XNET_PORT &&
+      !memcmp(ip + 12, (const uint8_t[4]){0, 0, 0, 1}, 4)) {
+    broadcast = !memcmp(ip + 16, (const uint8_t[4]){255, 255, 255, 255}, 4);
+    if ((broadcast || !memcmp(ip + 16, ip + 12, 4)) &&
+        !(get16(ip + 6) & 0x3fff) && !sum(ip, header, 0) &&
         get16(udp + 4) == n &&
-        (!get16(udp + 6) || !transport_sum(ip, udp, n, 17)))
+        (!get16(udp + 6) || !transport_sum(ip, udp, n, IP_PROTO_UDP)))
       xsec_receive(&security, frame + 6, udp + 8, n - 8, broadcast);
-    pbuf_free(p);
-    return ERR_OK;
+    goto drop;
   }
-  /* Secure startup never delivers plaintext XNet port traffic to Halo. */
-  if (!(startup_flags & 1)) {
-    pbuf_free(p);
-    return ERR_OK;
-  }
-  return ethernet_input(p, netif);
+  if (!ip[12] || !ip[16])
+    goto drop;
+  if (startup_flags & XNET_STARTUP_BYPASS_SECURITY)
+    return ethernet_input(p, netif);
+  /* Secure startup gives title sockets no plaintext at all; the stack's own
+   * DHCP client is the only other receiver. */
+  if (udp && get16(udp) == LWIP_IANA_PORT_DHCP_SERVER &&
+      get16(udp + 2) == LWIP_IANA_PORT_DHCP_CLIENT)
+    return ethernet_input(p, netif);
+drop:
+  pbuf_free(p);
+  return ERR_OK;
 }
 err_t halo_xnet_input(struct pbuf *p, struct netif *netif) {
   return tcpip_inpkt(p, netif, secure_ethernet_input);
@@ -268,7 +275,7 @@ void halo_xnet_attach(struct netif *netif) {
 }
 int halo_net_security_start(unsigned flags) {
   int r = 0;
-  if (flags & ~1u)
+  if (flags & ~(unsigned)XNET_STARTUP_BYPASS_SECURITY)
     return 10022;
   LOCK_TCPIP_CORE();
   if (security_refs && flags != startup_flags)

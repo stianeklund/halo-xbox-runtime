@@ -307,19 +307,21 @@ int audio_output_pause(struct audio_voice *v, int pause)
     return nxAudioVoiceStart(&h->hardware) || failed();
 }
 
+/* LBO and EBO count samples (frames) for PCM and ADPCM alike, as the
+ * patched driver's CBO and SSL lengths do. */
 int audio_output_buffer_loop(struct audio_voice *v)
 {
     struct apu_voice *h = v->backend;
     unsigned int scale = v->format.tag == 0x69 ? 64 : 1;
-    unsigned int count = v->buffer_size / v->format.block_align;
-    unsigned int end = v->looping && v->loop_end ? v->loop_end / scale : count;
+    unsigned int count = v->buffer_size / v->format.block_align * scale;
+    unsigned int end = v->looping && v->loop_end ? v->loop_end : count;
     if (!h->valid || !h->buffer_attached) return 1;
     if (!end) return 0;
     KIRQL irql = KeRaiseIrqlToDpcLevel();
     apu_wait_for_pio(5);
     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, h->hardware.voice_index);
     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
-    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_BUF_LBO, v->loop_start / scale);
+    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_BUF_LBO, v->loop_start);
     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_BUF_EBO, end - 1);
     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
     KfLowerIrql(irql);

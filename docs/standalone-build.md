@@ -166,20 +166,27 @@ Compat files:
 
 | File | Replaces |
 |---|---|
-| `xapi_init.c` | `XapiInitProcess` utility-drive mount: `XapiSelectCachePartition`, `XMountUtilityDrive`, `XapiValidateDiskPartition`. Formatting goes through nxdk `nxFormatVolume`. |
-| `xapi_memory.c` | `XPhysicalAlloc`, `physical_memory_protect` |
-| `xapi_thread.c` | `RaiseException`, `PulseEvent` (kb.json only has placeholders; callee-pops ABI from the original `ret N`) |
-| `xapi_fileio.c` | `ReadFileEx`/`WriteFileEx` (NtReadFile/NtWriteFile with the kernel `NtUserIoApcDispatcher` APC; used by the cache-file reader and the DVD→Z: copy thread) |
-| `xapi_xvutil.c` | `GetFileAttributesA` (kb `file_get_full_attributes`), `GlobalMemoryStatus`, `Sleep`, `SetFileAttributesA`, `RemoveDirectoryA`, `XQueryValue`, the `LocalAlloc` twin at 0x1d0bb9, `XapiSetLastNTError`, and an empty-directory `XFindFirstSaveGame` (no U: drive yet). A 0-returning stub is wrong for most of these: GetFileAttributesA returning 0 means "file exists". |
-| `xapi_heap.c` | `LocalAlloc`/`LocalFree`/`LocalReAlloc`/`LocalSize` (kb `FUN_001d0c48`/`c16`/`c65`/`c02`) on the pdclib heap |
-| `xapi_launch.c` | `XGetLaunchInfo` |
-| `d3d8_device.c` | D3D8 stage 1: device creation, the device fields that game and lifted D3D code read (`D3D_g_pDevice` +0x1c/+0x3f0/+0x410/+0x2150), textures/cube/volume/vertex/index/palette resources in Xbox header layout with contiguous memory, locks, surface descriptions, caps (the original table), transforms, the D3DX projection/transform helpers, and vblank-paced `Present`. |
-| `d3d8_draw.c` | D3D8 stage 2 draw path on pbkit, transcribed from the XDK: lazy state flush (0x1f1b50), vertex shaders and FVF (Create/Load/Select/Set/SetConstant), `SetPixelShader`/`SetPixelShaderProgram`, `SetTexture`/`SetPalette`/`SetTextureStageState`, `SetStreamSource`/`SetIndices`, `DrawVertices`/`DrawIndexedVertices`, immediate mode (`Begin`/`SetVertexData*`/`End`), and the init-time default state (0x1f3000). XDK const tables are C arrays with their source VA. Fixed-function combiners, lighting, texture transforms and transforms call `halo_standalone_missing`. Resource `Data` holds physical addresses (DMA object 3 spans RAM). Debug knob `-DHALO_STANDALONE_TRACE_TEXTURE_STAGES=ON` logs the pushed `SET_SHADER_STAGE_PROGRAM` and each stage's texture, pushed format and control0 before each draw (first 64 draws, plus every draw that would trip xemu's `get_sampler_type` `dim == 2` assert, tagged `DIM!`), to DbgPrint and COM1. |
-| `crt_string.c` | LIBCMT `__ascii_stricmp` (0x1e3a50), same algorithm as MSVC |
-| `xnet.c` | `XNetStartup`, `WSAStartup`, `XNetGetTitleXnAddr` (static Ethernet), `XNetCleanup`, `WSACleanup` succeed; `socket` returns INVALID_SOCKET, so endpoint creation takes the game's own error path. The debug build asserts if the transport does not come up. |
-| `xapi_input.c` | `XInputDebugGetKeystroke` (`FUN_00252ad9`): always returns `ERROR_HANDLE_EOF` (0x26), as the original does for an empty queue. A 0 stub means "key available" and `input_update_keyboard_devices` spins forever. |
-| `dsound_nxdk.c`, `audio_mixer.c`, `crt/nxdk_audio.c` | DirectSound stream/buffer adapter, PCM/Xbox ADPCM mixer, and nxdk AC97 transport (see Audio). |
-| `dsound_silent.c` | Optional silent backend (`HALO_STANDALONE_AUDIO=OFF`). |
+| `compat/xapi/init.c` | `XapiInitProcess` utility-drive mount: `XapiSelectCachePartition`, `XMountUtilityDrive`, `XapiValidateDiskPartition`. Formatting goes through nxdk `nxFormatVolume`. |
+| `compat/xapi/memory.c` | `XPhysicalAlloc`, `physical_memory_protect` |
+| `compat/xapi/thread.c` | `RaiseException`, `PulseEvent` (kb.json only has placeholders; callee-pops ABI from the original `ret N`) |
+| `compat/xapi/fileio.c` | `ReadFileEx`/`WriteFileEx` (NtReadFile/NtWriteFile with the kernel `NtUserIoApcDispatcher` APC; used by the cache-file reader and the DVD→Z: copy thread) |
+| `compat/xapi/xvutil.c` | `GetFileAttributesA` (kb `file_get_full_attributes`), `GlobalMemoryStatus`, `Sleep`, `SetFileAttributesA`, `RemoveDirectoryA`, `XQueryValue`, the `LocalAlloc` twin at 0x1d0bb9 and `XapiSetLastNTError`. A 0-returning stub is wrong for most of these: GetFileAttributesA returning 0 means "file exists". |
+| `compat/xapi/heap.c` | `LocalAlloc`/`LocalFree`/`LocalReAlloc`/`LocalSize` (kb `FUN_001d0c48`/`c16`/`c65`/`c02`) on the pdclib heap |
+| `compat/xapi/launch.c` | `XGetLaunchInfo` |
+| `compat/xapi/input.c` | XAPI controller input on nxdk's USB/XID host driver. |
+| `compat/xapi/keyboard.c` | The debug keyboard queue: `XInputDebugInitKeyboardQueue` (0x252d73) and `XInputDebugGetKeystroke` (0x252ad9). An empty queue returns `ERROR_HANDLE_EOF` (0x26) as the original does; a 0 stub means "key available" and `input_update_keyboard_devices` spins forever. |
+| `compat/xapi/savegame.c` | XAPILIB saved-game and directory-enumeration routines. |
+| `compat/xapi/nickname.c` | Nicknames (0x1d26f3 set, 0x1d29eb find first) in `NICKNAME.XBN`. |
+| `compat/xapi/signature.c` | Content signatures (`XCalculateSignature*`). |
+| `compat/d3d8/device.c` | Device creation, the device fields that game and lifted D3D code read (`D3D_g_pDevice` +0x1c/+0x3f0/+0x410/+0x2150), textures/cube/volume/vertex/index/palette resources in Xbox header layout with contiguous memory, locks, surface descriptions, caps (the original table), transforms, the D3DX projection/transform helpers, `Clear`, and a `Present` that returns once the vblank has latched the flip (the device has one back buffer). |
+| `compat/d3d8/state.c` | Render-state and texture-state setters, transcribed from the XDK with the same pushes and mirror stores. |
+| `compat/d3d8/draw.c` | D3D8 stage 2 draw path on pbkit, transcribed from the XDK: lazy state flush (0x1f1b50), vertex shaders and FVF (Create/Load/Select/Set/SetConstant), `SetPixelShader`/`SetPixelShaderProgram`, `SetTexture`/`SetPalette`/`SetTextureStageState`, `SetStreamSource`/`SetIndices`, `DrawVertices`/`DrawIndexedVertices`, immediate mode (`Begin`/`SetVertexData*`/`End`), and the init-time default state (0x1f3000). XDK const tables are C arrays with their source VA. Fixed-function color/alpha operations it does not transcribe, lighting (0x1f1640) and the inverse model-view transform (0x1f2650) call `halo_standalone_missing`. Resource `Data` holds physical addresses (DMA object 3 spans RAM). Debug knob `-DHALO_STANDALONE_TRACE_TEXTURE_STAGES=ON` logs the pushed `SET_SHADER_STAGE_PROGRAM` and each stage's texture, pushed format and control0 before each draw (first 64 draws, plus every draw that would trip xemu's `get_sampler_type` `dim == 2` assert, tagged `DIM!`), to DbgPrint and COM1. |
+| `compat/d3d8/internal.h` | What the three D3D8 files share: the device layout and state mirrors, and the checked push-buffer API. |
+| `compat/crt/string.c`, `compat/crt/stdio.c`, `compat/crt/wprintf.c` | LIBCMT internals kb.json only knows by address: `__ascii_stricmp` (0x1e3a50), the `crt_*` stdio/string routines, and the wide printf family. |
+| `compat/xnet/xnet.c`, `compat/xnet/security.c`, `crt/nxdk_xnet.c` | The Xbox Winsock ABI on lwIP and the XNet secure transport; see [standalone-networking.md](standalone-networking.md). |
+| `compat/audio/dsound_nxdk.c`, `compat/audio/mixer.c`, `crt/nxdk_audio.c` or `crt/nxdk_audio_apu.c` | DirectSound stream/buffer adapter, PCM/Xbox ADPCM mixer, and the AC97 or APU transport (see Audio and [audio-apu.md](audio-apu.md)). |
+| `compat/audio/dsound_silent.c` | Optional silent backend (`HALO_STANDALONE_AUDIO=OFF`). |
+| `compat/bink/` | RAD Bink playback, file IO and codecs; see [bink.md](bink.md). |
 | `crt/msvc_print.c` | nxdk's `_PDCLIB_print` rebuilt so a NULL `%s` prints `(null)` like MSVC LIBCMT. pdclib calls `strlen(NULL)` and faults; Halo relies on the MSVC behaviour. Built with nxdk's flags (`crt/CMakeLists.txt`) and linked ahead of `libpdclib`. |
 
 Source adaptations (all under `HALO_STANDALONE`, none in reference codegen):
@@ -319,7 +326,7 @@ Earlier blockers, now fixed:
   stubs. They are lifted now.
 - `d3d_find_flipcount` (d3d_intimacy.cpp #53) reads XDK device fields at fixed
   addresses: interrupts +0x23ac, vblank callback +0x24ec, flip count +0x2518
-  of the static device at 0x1fbb10. `d3d8_device.c` now places the compat
+  of the static device at 0x1fbb10. `compat/d3d8/device.c` now places the compat
   device there, stores the callback, and counts swaps in `Present`. A
   time-critical thread stands in for the XDK vblank DPC: it completes the
   flip and calls `main_vertical_blank_interrupt_handler` (frame timing and
@@ -416,7 +423,7 @@ The standalone's extra ~7.6MB of D3D memory has two sources:
 
 * pbkit's `pb_init` always allocates its own triple-buffered framebuffers
   (tile 0) and a Z-compressed depth buffer (tile 1). That is 4 × 640×480×32bpp,
-  about 4.7MB. `d3d8_device.c` never uses them: it renders into its own
+  about 4.7MB. `compat/d3d8/device.c` never uses them: it renders into its own
   front, back and depth surfaces.
 * The push buffer is `PUSH_BUFFER_BYTES` (4MB). Halo asks the XDK for 768KB,
   but pbkit never wraps, so one frame must fit.
@@ -447,7 +454,7 @@ needs push-buffer wrap support in pbkit, or a measured per-frame high-water mark
    appear (`FUN_001087b0` chain, `cache_file_read_header_into_slot`,
    `simple_cache_copy_thread`, ...) via `/lift`, and add XAPI compat routines
    (save-game enumeration, per-title T:/U: drives).
-2. D3D8 stage 2 on pbkit: the resource layer exists. `d3d8_device.c` sets
+2. D3D8 stage 2 on pbkit: the resource layer exists. `compat/d3d8/device.c` sets
    the video mode, scans out the front buffer (`Present` swaps the bits of
    the back/front buffer headers and points PCRTC at the new front), keeps the
    render target and depth buffer from `SetRenderTarget`, and clears through

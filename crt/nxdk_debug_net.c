@@ -106,7 +106,8 @@ static void NIC_CALL receive_packet(struct title_interface *self, unsigned flags
   (void)flags;
   (void)type;
   /* XBDM loans the frame only until this callback returns. Copy the Ethernet
-   * header too; the packet adapter checks its MACs before queuing to lwIP. */
+   * header too: the netif input (XNet's filter, then ethernet_input) parses
+   * it. */
   if (!title_netif || initializing || length > 1500)
     return;
   p = pbuf_alloc(PBUF_RAW, length + ETHERNET_HEADER + ETH_PAD_SIZE, PBUF_RAM);

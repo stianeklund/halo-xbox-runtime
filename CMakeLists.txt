@@ -76,10 +76,19 @@ add_custom_command(
 )
 add_custom_target(standalone_decl DEPENDS "${gen_dir}/decl.h")
 
+# build_info.c embeds halo's git revision: regenerate it whenever halo's HEAD
+# moves (its reflog changes on every commit and checkout). An exported tree
+# without git keeps the first revision it was built with.
+set(_build_info_depends "${HALO_ROOT}/tools/build/gen-build-info.py")
+execute_process(COMMAND git -C "${HALO_ROOT}" rev-parse --absolute-git-dir
+	OUTPUT_VARIABLE _halo_git_dir OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(_halo_git_dir AND EXISTS "${_halo_git_dir}/logs/HEAD")
+	list(APPEND _build_info_depends "${_halo_git_dir}/logs/HEAD")
+endif()
 add_custom_command(
 	OUTPUT "${gen_dir}/build_info.c"
 	COMMAND "${Python3_EXECUTABLE}" "${HALO_ROOT}/tools/build/gen-build-info.py" > "${gen_dir}/build_info.c"
-	DEPENDS "${HALO_ROOT}/tools/build/gen-build-info.py"
+	DEPENDS ${_build_info_depends}
 	WORKING_DIRECTORY "${HALO_ROOT}"
 	VERBATIM
 )
@@ -166,8 +175,10 @@ file(GENERATE OUTPUT "${gen_dir}/objects.txt" CONTENT
 	"$<JOIN:$<TARGET_OBJECTS:halo>,\n>\n$<JOIN:$<TARGET_OBJECTS:standalone_crt>,\n>\n$<JOIN:$<TARGET_OBJECTS:standalone_net>,\n>\n")
 
 set(_seed_args)
+set(_seed_depends)
 if(HALO_STANDALONE_SEED_XBE)
 	set(_seed_args --seed-xbe "${HALO_STANDALONE_SEED_XBE}")
+	set(_seed_depends "${HALO_STANDALONE_SEED_XBE}")
 	message(WARNING "HALO_STANDALONE_SEED_XBE is set: legacy data is seeded from ${HALO_STANDALONE_SEED_XBE}. The output is NOT standalone.")
 endif()
 
@@ -184,6 +195,8 @@ add_custom_command(
 	DEPENDS halo standalone_crt standalone_net $<TARGET_OBJECTS:halo> $<TARGET_OBJECTS:standalone_crt> $<TARGET_OBJECTS:standalone_net>
 		"${STANDALONE_TOOLS}/gen_legacy_image.py"
 		"${STANDALONE_TOOLS}/deps_inventory.py" "${HALO_ROOT}/kb.json"
+		"${HALO_ROOT}/tools/analysis/knowledge.py" "${HALO_ROOT}/src/xboxkrnl.exe.def"
+		"${HALO_STANDALONE_LAYOUT_XBE}" ${_seed_depends} ${NXDK_LIBS}
 	VERBATIM
 )
 
@@ -213,6 +226,7 @@ $<JOIN:${NXDK_LIBS},
 
 add_custom_command(
 	OUTPUT "${PROJECT_BINARY_DIR}/halo.exe"
+	BYPRODUCTS "${PROJECT_BINARY_DIR}/halo.map"
 	COMMAND lld-link -subsystem:windows -fixed -base:0x00010000 -stack:0x80000
 		-merge:.edata=.edataxb -safeseh:no -nodefaultlib -entry:standalone_entry
 		-include:_automount_d_drive
@@ -241,7 +255,8 @@ add_custom_command(
 		"${PROJECT_BINARY_DIR}/halo.map" "${PROJECT_BINARY_DIR}/cachebeta.map"
 		--kb "${HALO_ROOT}/kb.json"
 	DEPENDS "${PROJECT_BINARY_DIR}/halo.exe" "${STANDALONE_TOOLS}/gen_stack_walk_map.py"
-		"${HALO_ROOT}/kb.json"
+		"${STANDALONE_TOOLS}/gen_legacy_image.py" "${STANDALONE_TOOLS}/deps_inventory.py"
+		"${STANDALONE_TOOLS}/symbolize.py" "${HALO_ROOT}/kb.json"
 	VERBATIM
 )
 

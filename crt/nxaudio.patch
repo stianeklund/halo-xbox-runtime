@@ -46,20 +46,31 @@
  
      // Pre-compute all SSL entries before touching hardware
      mcpx_ssl_t hw_ssls[MCPX_HW_MAX_PRD_ENTRIES_PER_SSL];
-@@ -134,6 +134,12 @@
-         ssl_indices_in_segment[index] = absolute_ssl_index % 64;
- 
+@@ -136,6 +136,12 @@
          index++;
-+    }
-+
+     }
+ 
 +    /* Do not silently accept a truncated buffer at a fragmented page edge. */
 +    if (bytes_left) {
 +        apu_set_last_error(NX_AUDIO_ERR_UNSUPPORTED);
 +        return false;
-     }
- 
++    }
++
      const uint32_t notifier_idx =
-@@ -249,39 +255,39 @@
+         MCPX_HW_NOTIFIER_BASE_OFFSET + (voice->voice_index * MCPX_HW_NOTIFIER_COUNT) + buffer_index;
+ 
+@@ -168,7 +174,9 @@
+ static bool insert_buffer_to_sge (nxAudioVoice *voice, const nxAudioBuffer *buffer)
+ {
+     const uint8_t *virtual_address = (const uint8_t *)buffer->buffer;
+-    const uint32_t total_samples = apu_format_bytes_to_blocks(&voice->format, buffer->size_bytes);
++    /* EBO counts samples, as SSL lengths do: an ADPCM block holds 64. */
++    const uint32_t total_samples = apu_format_bytes_to_blocks(&voice->format, buffer->size_bytes) *
++                                   (voice->format.codec == NX_AUDIO_CODEC_ADPCM ? 64 : 1);
+     const uint32_t ebo = total_samples - 1;
+     const uint32_t needed_sges =
+         (((uintptr_t)virtual_address & (PAGE_SIZE - 1)) + buffer->size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+@@ -249,39 +257,39 @@
      }
  
      const KIRQL irql = KeRaiseIrqlToDpcLevel();
@@ -82,19 +93,7 @@
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_FMT, voice->cfg_fmt);
-+
-+    MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, FALSE);
-+    if (!insert_buffer_to_ssl(voice, buffer, buffer_index)) {
-+        MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, TRUE);
-+        apu_wait_for_pio(1);
-+        apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
-+        KfLowerIrql(irql);
-+        return false;
-+    }
-+    voice->buffers_hardware[buffer_index] = buffer;
-+    voice->next_ssl_index ^= 1;
-+    apu_wait_for_pio(1);
-     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
+-    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
 -
 -    uint8_t buffer_index = 0xFF;
 -    for (uint8_t j = 0; j < 2; j++) {
@@ -103,7 +102,7 @@
 -            break;
 -        }
 -    }
--
+ 
 -    if (buffer_index < 2) {
 -        MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, FALSE);
 -        if (!insert_buffer_to_ssl(voice, buffer, buffer_index)) {
@@ -112,10 +111,20 @@
 -            return false;
 -        }
 -        voice->buffers_hardware[buffer_index] = buffer;
--        KfLowerIrql(irql);
++    MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, FALSE);
++    if (!insert_buffer_to_ssl(voice, buffer, buffer_index)) {
++        MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, TRUE);
++        apu_wait_for_pio(1);
++        apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
+         KfLowerIrql(irql);
 -        return true;
--    }
++        return false;
+     }
 -
++    voice->buffers_hardware[buffer_index] = buffer;
++    voice->next_ssl_index ^= 1;
++    apu_wait_for_pio(1);
++    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
      KfLowerIrql(irql);
 -    apu_set_last_error(NX_AUDIO_ERR_QUEUE_FULL);
 -    return false;
@@ -123,7 +132,7 @@
  }
  
  bool nxAudioBufferSubmit (nxAudioVoice *voice, const nxAudioBuffer *buffer)
-@@ -311,6 +317,7 @@
+@@ -311,6 +319,7 @@
          }
      }
  
@@ -131,15 +140,13 @@
      apu_wait_for_pio(4);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
-@@ -320,8 +327,10 @@
+@@ -320,8 +329,10 @@
      MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, FALSE);
      if (!insert_buffer_to_sge(voice, buffer)) {
          MmLockUnlockBufferPages((PVOID)buffer->buffer, buffer->size_bytes, TRUE);
--        return false;
--    }
 +        KfLowerIrql(irql);
-+        return false;
-+    }
+         return false;
+     }
 +    KfLowerIrql(irql);
      return true;
  }
@@ -164,12 +171,18 @@
  }
  
  bool nxAudioVoiceCreate (nxAudioVoice *voice, const nxAudioFormat *format)
-@@ -347,2 +351,3 @@
+@@ -344,8 +348,9 @@
+     //      = -6.0206 * log2(gain)
+     const float attenuation_db = fast_mul_log2f(-6.0206f, gain);
+ 
 -    // Add a 6 dB floor preserving headroom in the mixbin accumulator when many voices sum together.
 -    const float total_db = attenuation_db + 6.0f;
 +    // Halo's DirectSound adapter includes the reference voice headroom.
 +    // Do not add another floor at both master and channel conversion.
 +    const float total_db = attenuation_db;
+ 
+     // Hardware register is 12-bit, in units of 1/64 dB (0x000 = 0 dB, 0xFFF = mute)
+     const int32_t units = (int32_t)(total_db * 64.0f);
 @@ -427,6 +432,7 @@
      voice->master_gain = gain;
      voice_update_volumes(voice);
@@ -178,7 +191,7 @@
      apu_wait_for_pio(6);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
-@@ -434,6 +439,7 @@
+@@ -434,6 +440,7 @@
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLB, voice->tar_volb);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLC, voice->tar_volc);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
@@ -186,7 +199,7 @@
      return true;
  }
  
-@@ -460,6 +466,7 @@
+@@ -460,6 +467,7 @@
  
      voice_update_volumes(voice);
  
@@ -194,7 +207,7 @@
      apu_wait_for_pio(6);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
-@@ -467,6 +474,7 @@
+@@ -467,6 +475,7 @@
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLB, voice->tar_volb);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLC, voice->tar_volc);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
@@ -202,7 +215,7 @@
  
      return true;
  }
-@@ -487,6 +495,7 @@
+@@ -487,6 +496,7 @@
  
      voice_update_volumes(voice);
  
@@ -210,7 +223,7 @@
      apu_wait_for_pio(6);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
-@@ -494,6 +503,7 @@
+@@ -494,6 +504,7 @@
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLB, voice->tar_volb);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_VOLC, voice->tar_volc);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
@@ -218,7 +231,7 @@
  
      return true;
  }
-@@ -518,11 +528,13 @@
+@@ -518,11 +529,13 @@
          voice->cfg_fmt |= APU_MAKE_VALUE(NV_PAVS_VOICE_CFG_FMT_LOOP, 1);
      }
  
@@ -232,7 +245,7 @@
      return true;
  }
  
-@@ -583,12 +595,14 @@
+@@ -583,12 +596,14 @@
      voice->tar_pitch_link &= ~((uint32_t)NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH);
      voice->tar_pitch_link |= APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH, (uint32_t)(int16_t)pitch_val);
  
@@ -247,7 +260,7 @@
  
      return true;
  }
-@@ -605,11 +619,13 @@
+@@ -605,11 +620,13 @@
      const uint32_t tar_pitch = APU_MAKE_VALUE(NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH, (uint32_t)(int16_t)pitch_val);
      voice->pitch = pitch;
  
@@ -261,7 +274,7 @@
      return true;
  }
  
-@@ -652,6 +668,7 @@
+@@ -652,6 +669,7 @@
  
      voice->amplitude_adsr_enabled = true;
  
@@ -269,7 +282,7 @@
      apu_wait_for_pio(6);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
-@@ -659,6 +676,7 @@
+@@ -659,6 +677,7 @@
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_ENVA, voice->cfg_enva);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_LFO_ENV, voice->tar_lfo_env);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
@@ -277,7 +290,7 @@
      return true;
  }
  
-@@ -701,6 +719,7 @@
+@@ -701,6 +720,7 @@
  
      voice->filter_adsr_enabled = true;
  
@@ -285,7 +298,7 @@
      apu_wait_for_pio(6);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
-@@ -708,6 +727,7 @@
+@@ -708,6 +728,7 @@
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_ENVF, voice->cfg_envf);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_MISC, voice->cfg_misc);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
@@ -293,7 +306,7 @@
      return true;
  }
  
-@@ -736,6 +756,7 @@
+@@ -736,6 +757,7 @@
      voice->cfg_misc &= ~((uint32_t)(NV_PAVS_VOICE_CFG_MISC_FMODE | (0x7 << 18)));
      voice->cfg_misc |= APU_MAKE_VALUE(NV_PAVS_VOICE_CFG_MISC_FMODE, mode) | APU_MAKE_VALUE((0x7 << 18), q_coefficient);
  
@@ -301,7 +314,7 @@
      apu_wait_for_pio(6);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
-@@ -743,6 +764,7 @@
+@@ -743,6 +765,7 @@
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_TAR_FCB, tar_fcb);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_CFG_MISC, voice->cfg_misc);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
@@ -309,7 +322,7 @@
  
      return true;
  }
-@@ -753,7 +775,8 @@
+@@ -753,7 +776,8 @@
          return 0;
      }
  
@@ -319,7 +332,24 @@
  }
  
  bool nxAudioVoiceSetPlaybackOffset (nxAudioVoice *voice, uint32_t byte_offset)
-@@ -783,11 +806,13 @@
+@@ -768,7 +792,9 @@
+         return false;
+     }
+ 
+-    const uint32_t block_offset = apu_format_bytes_to_blocks(&voice->format, byte_offset);
++    /* CBO counts samples like EBO: an ADPCM block holds 64. */
++    const uint32_t sample_offset = apu_format_bytes_to_blocks(&voice->format, byte_offset) *
++                                   (voice->format.codec == NX_AUDIO_CODEC_ADPCM ? 64 : 1);
+ 
+     if (nxAudioVoiceGetState(voice) != NX_STOPPED) {
+         uint32_t par_state;
+@@ -778,16 +804,18 @@
+     }
+ 
+     const uint32_t ebo = g_hw_voices[voice->voice_index].par_next & NV_PAVS_VOICE_PAR_NEXT_EBO;
+-    if (block_offset > ebo) {
++    if (sample_offset > ebo) {
+         apu_set_last_error(NX_AUDIO_ERR_INVALID_PARAM);
          return false;
      }
  
@@ -327,13 +357,14 @@
      apu_wait_for_pio(4);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
-     apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_BUF_CBO, block_offset);
+-    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_BUF_CBO, block_offset);
++    apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_VOICE_BUF_CBO, sample_offset);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
 +    KfLowerIrql(irql);
  
      return true;
  }
-@@ -856,6 +881,7 @@
+@@ -856,6 +884,7 @@
          voice_update_volumes(voice);
      }
  
@@ -341,17 +372,14 @@
      apu_wait_for_pio(3);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_SET_CURRENT_VOICE, voice->voice_index);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 1);
-@@ -870,6 +896,7 @@
+@@ -870,6 +899,7 @@
      }
      apu_wait_for_pio(1);
      apu_write_reg(APU_VP_OFFSET + NV1BA0_PIO_VOICE_LOCK, 0);
--
--    return true;
--}
 +    KfLowerIrql(irql);
-+
-+    return true;
-+}
+ 
+     return true;
+ }
 --- a/include/nxaudio.h
 +++ b/include/nxaudio.h
 @@ -155,6 +155,7 @@

@@ -184,11 +184,26 @@ long __stdcall FUN_002301a0(BINK *bink, long on)
   return result;
 }
 
-/* 0x2302d0. set_frame: frame is one-based; 0 and 1 both select the first. */
+/* 0x2302d0. set_frame: frame is one-based; 0 and 1 both select the first.
+ * Not in the original: a frame past the frame table (InternalFrames + 1
+ * offsets), or one larger than the header's largest frame (the compframe
+ * allocation), fails as a read error instead of reading past frameoffsets or
+ * overflowing compframe. */
 void GotoFrame(BINK *bink, unsigned long frame)
 {
+  unsigned long size;
+
   if (frame) {
     frame--;
+  }
+  if (frame >= bink->InternalFrames) {
+    bink->ReadError = 1;
+    return;
+  }
+  size = (bink->frameoffsets[frame + 1] & ~1ul) - (bink->frameoffsets[frame] & ~1ul);
+  if (size > bink->field_e8) {
+    bink->ReadError = 1;
+    return;
   }
   if (bink->trackindex != -1) {
     FUN_0022e0c0(bink);
@@ -207,7 +222,7 @@ void GotoFrame(BINK *bink, unsigned long frame)
                       ((bink->frameoffsets[frame] & ~1ul) - (bink->frameoffsets[0] & ~1ul));
   } else {
     bink->io.ReadFrame(&bink->io, frame, (long)(bink->frameoffsets[frame] & ~1ul), bink->compframe,
-                       (bink->frameoffsets[frame + 1] & ~1ul) - (bink->frameoffsets[frame] & ~1ul));
+                       size);
   }
   if (bink->trackindex != -1) {
     FUN_0022e0c0(bink);

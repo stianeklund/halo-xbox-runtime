@@ -2,7 +2,7 @@
  * Standalone compat: Direct3D 8 (Xbox) vertex shaders, pixel shaders,
  * textures, vertex streams, the lazy state flush and the draw calls.
  *
- * Same approach as d3d8_state.c: each routine is transcribed from the XDK
+ * Same approach as state.c: each routine is transcribed from the XDK
  * code in cachebeta.xbe (VA in the comment above it). The same NV2A methods
  * and values are pushed, and the same mirror, dirty-flag and device-field
  * stores are made. Only the XDK's own push-buffer management (MakeSpace
@@ -13,53 +13,21 @@
  * arrays with their source VA. Its mutable state (the FVF shader object,
  * the stream table, the texture-stage mirror) stays at the legacy address.
  */
-#include "xbox.h"
-#include "nv_regs.h"
+#include "internal.h"
 
-uint32_t *pb_begin(void);
-void pb_end(uint32_t *end);
-void pb_reset(void);
 int pb_busy(void);
-int compat_d3d_pbkit_ready(void);
-void halo_standalone_missing(const char *name);
-void *__cdecl compat_malloc(size_t size) __asm__("_malloc");
-void __cdecl compat_free(void *memory) __asm__("_free");
-void *__cdecl compat_memcpy(void *dst, const void *src, size_t size) __asm__("_memcpy");
 
-#define D3D_OK 0
-#define E_OUTOFMEMORY 0x8007000e
-
-/* Push-buffer method header: dword count << 18 | method. */
-#define METHOD(method, count) (((unsigned long)(count) << 18) | (method))
 /* Non-incrementing method (every dword goes to the same register). */
 #define METHOD_NONINC(method, count) (0x40000000ul | METHOD(method, count))
 
-#define D3D_RENDER_STATE ((unsigned long *)0x1fb698)
-#define D3D_TEXTURE_STATE ((unsigned long *)0x1fb498)
-#define TEXTURE_STATE_STRIDE 32
-
-/* Device fields. */
-#define DEVICE_DIRTY 0x08
-#define DEVICE_STATE_FLAGS 0x0c
-#define DEVICE_CURRENT_TIME 0x1c
-#define DEVICE_RENDER_TARGET 0x40c
-#define DEVICE_DEPTH_STENCIL 0x410
 #define DEVICE_VERTEX_SHADER 0x470
 #define DEVICE_VERTEX_SHADER_HANDLE 0x474
-#define DEVICE_Z_SCALE_W 0x4f4
-#define DEVICE_Z_SCALE 0x4f8
 #define DEVICE_TRANSFORM_FLAGS 0x4fc
-#define DEVICE_SUPER_SAMPLE_SCALE_X 0x500
-#define DEVICE_SUPER_SAMPLE_SCALE_Y 0x504
-#define DEVICE_SUPER_SAMPLE_SCALE 0x508
-#define DEVICE_DERIVED_PROJECTION_MATRIX 0x5a0
 #define DEVICE_VIEW_MATRIX 0x880
 #define DEVICE_WORLD_MATRIX 0xa00
 #define DEVICE_BLEND_MATRIX_1 0xa40
-#define DEVICE_VIEWPORT 0xb00
 #define DEVICE_VS_CONSTANT_SHADOW 0xcc  /* 16-byte slot index */
 #define DEVICE_VS_PROGRAM_SHADOW 0x18c  /* 16-byte slot index */
-#define DEVICE_BUFFER_SURFACES 0x2150
 
 /* device+0xc bits. */
 #define STATE_FLAG_W_BUFFER 0x2
@@ -72,9 +40,6 @@ void *__cdecl compat_memcpy(void *dst, const void *src, size_t size) __asm__("_m
 #define RS_MULTISAMPLEANTIALIAS_ADDRESS ((unsigned long *)0x1fb8a8)
 #define RS_MULTISAMPLETYPE_ADDRESS ((unsigned long *)0x1fb8b0)
 #define MULTISAMPLE_SUPERSAMPLE_BIT 0x1000
-#define D3DZB_USEW 2
-#define D3DRS_VERTEXBLEND 0x75
-#define D3DRS_NORMALIZENORMALS 0x7a
 
 /* Vertex shader object (CreateVertexShader 0x1eaf70 / FVF build 0x1eaa20),
  * as dword indices. 16 input slots plus 4 fixed-function texcoord
@@ -185,32 +150,23 @@ static const unsigned long passthrough_program_1fa140[0x30] = {
 #define FLOAT_ONE 1.0f                  /* 0x2533c8 */
 #define FLOAT_TWO_POW_32 4294967296.0f  /* 0x25fb8c */
 
-typedef union {
-  unsigned long u;
-  float f;
-} dword_float;
-
 /* Push buffer.
  *
  * pbkit never wraps: it only rewinds to its head on pb_reset. The XDK wraps
- * on its own (MakeSpace), so a long frame can outgrow pbkit's buffer.
- * push_begin takes the dword count the XDK reserves and rewinds first when
- * the frame would run into the tail; pb_reset waits until the GPU has
- * fetched everything and jumped back, so this only costs a stall. */
+ * on its own (MakeSpace), so a long frame can outgrow pbkit's buffer. A
+ * push reserves the dword count the XDK reserves and rewinds first when the
+ * frame would run into the tail; pb_reset waits until the GPU has fetched
+ * everything and jumped back, so this only costs a stall. */
 #define PUSH_BUFFER_BYTES (4ul * 1024 * 1024)
 #define PUSH_REWIND_MARGIN_DWORDS (64ul * 1024 / 4)
 #define PUSH_SCRATCH_DWORDS 0x2000
 
 static uint32_t push_scratch[PUSH_SCRATCH_DWORDS];
 static uint32_t *push_head;
+static uint32_t *push_limit;
+static int push_dropped;
 
-#ifdef HALO_STANDALONE_NO_GPU_STATE
-#define gpu_state_ready() 0
-#else
-#define gpu_state_ready() compat_d3d_pbkit_ready()
-#endif
-
-/* Size handed to pb_size before pb_init (d3d8_device.c). */
+/* Size handed to pb_size before pb_init (device.c). */
 unsigned long compat_d3d_push_buffer_bytes(void)
 {
   return PUSH_BUFFER_BYTES;
@@ -254,17 +210,11 @@ static void check_push_thread(unsigned long caller)
   }
 }
 
-static uint32_t *push_begin(unsigned long dwords)
+static uint32_t *push_reserve(unsigned long dwords, unsigned long caller)
 {
   uint32_t *p;
 
-  check_push_thread((unsigned long)__builtin_return_address(0));
-  if (!gpu_state_ready()) {
-    if (dwords > PUSH_SCRATCH_DWORDS) {
-      halo_standalone_missing("d3d8_draw: push larger than the scratch buffer");
-    }
-    return push_scratch;
-  }
+  check_push_thread(caller);
   p = pb_begin();
   if (push_head &&
       (unsigned long)(p - push_head) + dwords + PUSH_REWIND_MARGIN_DWORDS >
@@ -273,19 +223,37 @@ static uint32_t *push_begin(unsigned long dwords)
     compat_d3d_push_rewind();
     p = pb_begin();
   }
+  push_limit = p + dwords;
+  push_dropped = 0;
   return p;
 }
 
-static void push_end(uint32_t *p)
+uint32_t *compat_d3d_push_reserve(unsigned long dwords)
 {
-  if (gpu_state_ready()) {
-    pb_end(p);
-  }
+  return push_reserve(dwords, (unsigned long)__builtin_return_address(0));
 }
 
-static unsigned long *device_field(unsigned long offset)
+uint32_t *compat_d3d_push_begin(unsigned long dwords)
 {
-  return (unsigned long *)(D3D_g_pDevice + offset);
+  if (gpu_state_ready()) {
+    return push_reserve(dwords, (unsigned long)__builtin_return_address(0));
+  }
+  if (dwords > PUSH_SCRATCH_DWORDS) {
+    halo_standalone_missing("d3d8_draw: push larger than the scratch buffer");
+  }
+  push_limit = push_scratch + dwords;
+  push_dropped = 1;
+  return push_scratch;
+}
+
+void compat_d3d_push_end(uint32_t *end)
+{
+  if (end > push_limit) {
+    halo_standalone_missing("d3d8_draw: push ran past its reservation");
+  }
+  if (!push_dropped) {
+    pb_end(end);
+  }
 }
 
 static float device_float(unsigned long offset)
@@ -389,14 +357,14 @@ static uint32_t *push_viewport(uint32_t *p)
   return p + 8;
 }
 
-/* The viewport push as its own block, for the setters in d3d8_state.c that
+/* The viewport push as its own block, for the setters in state.c that
  * call 0x1e9db0 right after MakeSpace. */
 void compat_d3d_push_viewport(void)
 {
   uint32_t *p;
 
-  p = push_begin(16);
-  push_end(push_viewport(p));
+  p = compat_d3d_push_begin(16);
+  compat_d3d_push_end(push_viewport(p));
 }
 
 /* 0x1eac20(dst, src, dwords): NV097_SET_TRANSFORM_PROGRAM in chunks of up
@@ -442,7 +410,7 @@ void compat_d3d_push_passthrough_program(void)
     program = passthrough_program_1f9fd0;
     dwords = 0x30;
   }
-  p = push_begin(dwords + 0x1e);
+  p = compat_d3d_push_begin(dwords + 0x1e);
   p[0] = METHOD(NV097_SET_TRANSFORM_CONSTANT_LOAD, 1);
   p[1] = 0;
   p[2] = METHOD(NV097_SET_TRANSFORM_CONSTANT, 8);
@@ -466,7 +434,7 @@ void compat_d3d_push_passthrough_program(void)
   p[10] = 0;
   p[11] = METHOD(NV097_SET_TRANSFORM_PROGRAM_LOAD, 1);
   p[12] = 0;
-  push_end(copy_transform_program(p + 13, program, dwords));
+  compat_d3d_push_end(copy_transform_program(p + 13, program, dwords));
 }
 
 /* 0x1eaa20(shader, fvf): build the FVF shader object. */
@@ -791,13 +759,13 @@ void __stdcall D3DDevice_LoadVertexShader(uint32_t handle, uint32_t offset)
     shadow_vertex_shader(vs, offset);
   }
   length = vs[VS_PROGRAM_LENGTH];
-  p = push_begin(length + 2);
+  p = compat_d3d_push_begin(length + 2);
   p[0] = METHOD(NV097_SET_TRANSFORM_PROGRAM_LOAD, 1);
   p[1] = offset;
   for (i = 0; i < length; i++) {
     p[2 + i] = vs[VS_PROGRAM + i];
   }
-  push_end(p + length + 2);
+  compat_d3d_push_end(p + length + 2);
 }
 
 /* 0x1eb4d0 */
@@ -811,16 +779,16 @@ void __stdcall D3DDevice_SelectVertexShader(uint32_t handle, uint32_t offset)
     *device_field(DEVICE_VERTEX_SHADER) = (unsigned long)vs;
     *device_field(DEVICE_VERTEX_SHADER_HANDLE) = handle;
     *device_field(DEVICE_DIRTY) |= 0x3a0;
-    p = push_begin(32);
+    p = compat_d3d_push_begin(32);
     p[0] = METHOD(NV097_SET_TRANSFORM_EXECUTION_MODE, 2);
     p[1] = TRANSFORM_EXECUTION_MODE_PROGRAM;
     p[2] = vs[VS_FLAGS] & VS_FLAG_CONTEXT_WRITE;
-    push_end(push_viewport(p + 3));
+    compat_d3d_push_end(push_viewport(p + 3));
   }
-  p = push_begin(2);
+  p = compat_d3d_push_begin(2);
   p[0] = METHOD(NV097_SET_TRANSFORM_PROGRAM_START, 1);
   p[1] = offset;
-  push_end(p + 2);
+  compat_d3d_push_end(p + 2);
 }
 
 /* 0x1eb7f0 */
@@ -848,20 +816,20 @@ void __stdcall D3DDevice_SetVertexShader(uint32_t shader)
     D3DDevice_SelectVertexShader(shader, 0);
     return;
   }
-  p = push_begin(32);
+  p = compat_d3d_push_begin(32);
   if (vs[VS_FLAGS] & VS_FLAG_PASSTHROUGH) {
     p[0] = METHOD(NV097_SET_TRANSFORM_PROGRAM_START, 1);
     p[1] = 0;
     p[2] = METHOD(NV097_SET_TRANSFORM_EXECUTION_MODE, 2);
     p[3] = TRANSFORM_EXECUTION_MODE_PROGRAM;
     p[4] = 0;
-    push_end(push_viewport(p + 5));
+    compat_d3d_push_end(push_viewport(p + 5));
     compat_d3d_push_passthrough_program();
     return;
   }
   p[0] = METHOD(NV097_SET_TRANSFORM_EXECUTION_MODE, 1);
   p[1] = TRANSFORM_EXECUTION_MODE_FIXED;
-  push_end(push_viewport(p + 2));
+  compat_d3d_push_end(push_viewport(p + 2));
 }
 
 /* 0x1eb8d0 */
@@ -881,7 +849,7 @@ void __stdcall D3DDevice_SetVertexShaderConstant(int register_index, const void 
   if (!(*device_field(DEVICE_STATE_FLAGS) & STATE_FLAG_NO_SHADOW)) {
     compat_memcpy(device_field((reg + DEVICE_VS_CONSTANT_SHADOW) << 4), src, dwords * 4);
   }
-  p = push_begin(dwords + 0x1a);
+  p = compat_d3d_push_begin(dwords + 0x1a);
   p[0] = METHOD(NV097_SET_TRANSFORM_CONSTANT_LOAD, 1);
   p[1] = reg;
   p += 2;
@@ -899,7 +867,7 @@ void __stdcall D3DDevice_SetVertexShaderConstant(int register_index, const void 
   for (i = 0; i < n; i++) {
     p[1 + i] = src[i];
   }
-  push_end(p + n + 1);
+  compat_d3d_push_end(p + n + 1);
 }
 
 /* 0x1f3f80(depth, &device+0x4f8), called by SetRenderTarget (0x1e7c15)
@@ -947,8 +915,6 @@ void compat_d3d_set_depth_scale(const void *depth_stencil)
 #define RESOURCE_FORMAT 3
 #define RESOURCE_SIZE 4
 #define RESOURCE_PARENT 5
-#define D3DCOMMON_TYPE_MASK 0x00070000ul
-#define D3DCOMMON_TYPE_SURFACE 0x00050000ul
 #define D3DCOMMON_INTREFCOUNT_MASK 0x00780000ul
 #define D3DCOMMON_INTREFCOUNT_1 0x00080000ul
 #define D3DCOMMON_REFCOUNT_MASK 0x0000fffful
@@ -1038,11 +1004,8 @@ void __stdcall D3DDevice_SetIndices(void *index_data, uint32_t base_vertex_index
  */
 
 #define DIRTY_POINT_PARAMS 0x1
-#define DIRTY_TRANSFORMS 0x2
-#define DIRTY_TEXTURE_TRANSFORM 0x4
 #define DIRTY_COMBINERS 0x8
 #define DIRTY_TEXTURE_CONTROL 0x10
-#define DIRTY_LIGHTING 0x20
 #define DIRTY_FOG 0x40
 #define DIRTY_VERTEX_FORMAT 0x80
 #define DIRTY_VERTEX_OFFSETS 0x200
@@ -1067,7 +1030,6 @@ void __stdcall D3DDevice_SetIndices(void *index_data, uint32_t base_vertex_index
 #define D3DRS_POINTSCALE_B 0x6f
 #define D3DRS_POINTSCALE_C 0x70
 #define D3DRS_POINTSIZE_MAX 0x71
-#define D3DRS_TWOSIDEDLIGHTING 0x79
 
 /* D3DTSS_* indices (mirror dword index within a stage). */
 #define D3DTSS_COLOROP 0x00
@@ -1099,7 +1061,6 @@ void __stdcall D3DDevice_SetIndices(void *index_data, uint32_t base_vertex_index
 #define D3DTSS_COLORKEYOP 0x13
 #define D3DTSS_COLORSIGN 0x14
 #define D3DTSS_ALPHAKILL 0x15
-#define D3DTSS_TEXCOORDINDEX 0x1c
 #define D3DTOP_BUMPENVMAP 0x19
 #define D3DTOP_BUMPENVMAPLUMINANCE 0x1a
 
@@ -1109,11 +1070,9 @@ void __stdcall D3DDevice_SetIndices(void *index_data, uint32_t base_vertex_index
 #define DEVICE_TEXTURE_CONTROL0 0x4cc
 #define DEVICE_TEXTURE_FORMAT_BITS 0x4dc
 #define DEVICE_LOD_BIAS 0x50c
-#define DEVICE_PIXEL_SHADER 0x414
 #define DEVICE_PS_COMBINER_COUNT 0x418
 #define DEVICE_FF_COMBINER_COUNT 0x594
 #define DEVICE_PS_DOTMAP_TEXTURE_MODES 0x41c
-#define DEVICE_PS_TEXTURE_MODES 0x420
 #define STATE_FLAG_FORCE_SPECULAR 0x40
 
 #define TEXTURE_STATE(stage, state) D3D_TEXTURE_STATE[(stage) * TEXTURE_STATE_STRIDE + (state)]
@@ -1200,10 +1159,10 @@ static void trace_texture_stages(const char *where)
     /* Not XDK behavior: keep xemu alive so the log reaches XBDM. The
      * offending stages draw as PROGRAM_NONE; the recorded value is kept so
      * the next draw is still checked against what the XDK code pushed. */
-    p = push_begin(2);
+    p = compat_d3d_push_begin(2);
     p[0] = METHOD(NV097_SET_SHADER_STAGE_PROGRAM, 1);
     p[1] = safe;
-    push_end(p + 2);
+    compat_d3d_push_end(p + 2);
     if (++trace_bad_count > TRACE_BAD_LIMIT) {
       return;
     }
@@ -1244,7 +1203,7 @@ static void trace_texture_stages(const char *where)
   trace_flush();
 }
 
-/* Coarse progress markers from d3d8_device.c (Present, Clear, init). */
+/* Coarse progress markers from device.c (Present, Clear, init). */
 static unsigned long trace_mark_count;
 
 void compat_d3d_trace_mark(const char *what)
@@ -1371,7 +1330,7 @@ static void lazy_point_params(void)
   uint32_t *p;
 
   *device_field(DEVICE_DIRTY) &= ~(unsigned long)DIRTY_POINT_PARAMS;
-  p = push_begin(0x20);
+  p = compat_d3d_push_begin(0x20);
   maximum = render_state_float(D3DRS_POINTSIZE_MAX);
   size = render_state_float(D3DRS_POINTSIZE);
   minimum = render_state_float(D3DRS_POINTSIZE_MIN);
@@ -1412,7 +1371,7 @@ static void lazy_point_params(void)
   }
   p[3] = METHOD(NV097_SET_POINT_SIZE, 1);
   p[4] = point_size;
-  push_end(p + 5);
+  compat_d3d_push_end(p + 5);
 }
 
 /* NV097_SET_SHADER_STAGE_PROGRAM stage modes (0x1f0750). */
@@ -1490,10 +1449,10 @@ static void lazy_texture_modes(void)
       modes = (modes << 5) | mode;
     }
   }
-  p = push_begin(2);
+  p = compat_d3d_push_begin(2);
   p[0] = METHOD(NV097_SET_SHADER_STAGE_PROGRAM, 1);
   p[1] = modes;
-  push_end(p + 2);
+  compat_d3d_push_end(p + 2);
   TRACE_STAGE_PROGRAM(modes);
 }
 
@@ -1649,7 +1608,7 @@ static void lazy_combiners(void)
     alpha_output[i] = 0;
   }
   *device_field(DEVICE_FF_COMBINER_COUNT) = count;
-  p = push_begin(38);
+  p = compat_d3d_push_begin(38);
   p[0] = METHOD(NV097_SET_COMBINER_CONTROL, 1);
   p[1] = count & 0xff;
   p[2] = METHOD(NV097_SET_COMBINER_COLOR_ICW, 8);
@@ -1668,7 +1627,7 @@ static void lazy_combiners(void)
   for (i = 0; i < 8; i++) {
     p[30 + i] = alpha_output[i];
   }
-  push_end(p + 38);
+  compat_d3d_push_end(p + 38);
 }
 
 /* 0x1fa720: NV097 texture filter MIN field by [min filter][mip filter]. */
@@ -1753,7 +1712,7 @@ static void lazy_texture_control(void)
     } else {
       signs = TEXTURE_STATE(stage, D3DTSS_COLORSIGN);
     }
-    p = push_begin(5);
+    p = compat_d3d_push_begin(5);
     p[0] = METHOD(NV097_SET_TEXTURE_ADDRESS + stage * 0x40, 2);
     p[1] = address;
     p[2] = control0;
@@ -1762,7 +1721,7 @@ static void lazy_texture_control(void)
     p[4] = ((unsigned long)lod & 0x1fff) | (mag_filter << 24) |
            texture_min_filter_table[min_filter * 3 + TEXTURE_STATE(stage, D3DTSS_MIPFILTER)] |
            signs | filter_bits;
-    push_end(p + 5);
+    compat_d3d_push_end(p + 5);
   }
 }
 
@@ -1827,7 +1786,7 @@ static void lazy_fog(void)
       }
       scale = float_bits(render_state_float(D3DRS_FOGDENSITY) * v.f);
     }
-    p = push_begin(12);
+    p = compat_d3d_push_begin(12);
     p[0] = METHOD(NV097_SET_FOG_GEN_MODE, 2);
     p[1] = gen_mode;
     p[2] = 1;
@@ -1839,28 +1798,28 @@ static void lazy_fog(void)
     p[8] = 0;
     p += 9;
     if (*device_field(DEVICE_PIXEL_SHADER) != 0 && *device_field(DEVICE_PS_COMBINER_COUNT) != 0) {
-      push_end(p);
+      compat_d3d_push_end(p);
       return;
     }
     p[0] = METHOD(NV097_SET_COMBINER_SPECULAR_FOG_CW0, 2);
     p[1] = SPECULAR_FOG_CW0 +
            (D3D_RENDER_STATE[D3DRS_SPECULARENABLE] ? SPECULAR_FOG_CW0_SPECULAR : 0);
     p[2] = SPECULAR_FOG_CW1;
-    push_end(p + 3);
+    compat_d3d_push_end(p + 3);
     return;
   }
-  p = push_begin(5);
+  p = compat_d3d_push_begin(5);
   p[0] = METHOD(NV097_SET_FOG_ENABLE, 1);
   p[1] = 0;
   p += 2;
   if (*device_field(DEVICE_PIXEL_SHADER) != 0 && *device_field(DEVICE_PS_COMBINER_COUNT) != 0) {
-    push_end(p);
+    compat_d3d_push_end(p);
     return;
   }
   p[0] = METHOD(NV097_SET_COMBINER_SPECULAR_FOG_CW0, 2);
   p[1] = D3D_RENDER_STATE[D3DRS_SPECULARENABLE] ? 0xe : 0xc;
   p[2] = SPECULAR_FOG_CW1;
-  push_end(p + 3);
+  compat_d3d_push_end(p + 3);
 }
 
 #define D3DTSS_TEXTURETRANSFORMFLAGS 0x09
@@ -1935,11 +1894,11 @@ static void lazy_texture_transform(void)
   }
   for (stage = 0; stage < TEXTURE_STAGE_COUNT; stage++) {
     flags = TEXTURE_STATE(stage, D3DTSS_TEXTURETRANSFORMFLAGS);
-    p = push_begin(TEXTURE_TRANSFORM_PUSH_DWORDS);
+    p = compat_d3d_push_begin(TEXTURE_TRANSFORM_PUSH_DWORDS);
     p[0] = METHOD(NV097_SET_TEXTURE_MATRIX_ENABLE + stage * 4, 1);
     if (flags == 0) {
       p[1] = 0;
-      push_end(p + 2);
+      compat_d3d_push_end(p + 2);
       continue;
     }
     index = TEXTURE_STATE(stage, D3DTSS_TEXCOORDINDEX);
@@ -2006,7 +1965,7 @@ static void lazy_texture_transform(void)
       texture_matrix_row(out + 12, m, 3);
       break;
     }
-    push_end(p + TEXTURE_TRANSFORM_PUSH_DWORDS);
+    compat_d3d_push_end(p + TEXTURE_TRANSFORM_PUSH_DWORDS);
   }
 }
 
@@ -2025,7 +1984,7 @@ static void lazy_lighting(void)
       D3D_RENDER_STATE[D3DRS_LIGHTING] != 0) {
     halo_standalone_missing("D3D fixed-function lighting (0x1f1640)");
   }
-  p = push_begin(8);
+  p = compat_d3d_push_begin(8);
   p[0] = METHOD(NV097_SET_LIGHTING_ENABLE, 1);
   p[1] = 0;
   p[2] = METHOD(NV097_SET_SPECULAR_ENABLE, 1);
@@ -2034,10 +1993,18 @@ static void lazy_lighting(void)
   p[5] = 0x20001;
   p[6] = METHOD(NV097_SET_LIGHT_TWO_SIDE_ENABLE, 1);
   p[7] = D3D_RENDER_STATE[D3DRS_TWOSIDEDLIGHTING];
-  push_end(p + 8);
+  compat_d3d_push_end(p + 8);
 }
 
-static void matrix4x4_multiply(float *out, const float *left, const float *right)
+/* 0x1f9f48 */
+const float compat_d3d_identity_matrix[16] = {
+  1.0f, 0.0f, 0.0f, 0.0f,
+  0.0f, 1.0f, 0.0f, 0.0f,
+  0.0f, 0.0f, 1.0f, 0.0f,
+  0.0f, 0.0f, 0.0f, 1.0f,
+};
+
+void compat_d3d_matrix4x4_multiply(float *out, const float *left, const float *right)
 {
   float result[16];
   int row;
@@ -2055,8 +2022,8 @@ static void matrix4x4_multiply(float *out, const float *left, const float *right
   compat_memcpy(out, result, sizeof(result));
 }
 
-static uint32_t *push_transposed_matrix(uint32_t *p, unsigned long method,
-                                        const float *matrix)
+uint32_t *compat_d3d_push_transposed_matrix(uint32_t *p, unsigned long method,
+                                            const float *matrix)
 {
   const unsigned long *words;
   int row;
@@ -2094,25 +2061,25 @@ static void lazy_transforms(void)
     return;
   }
 
-  matrix4x4_multiply(model_view, (const float *)device_field(DEVICE_WORLD_MATRIX),
+  compat_d3d_matrix4x4_multiply(model_view, (const float *)device_field(DEVICE_WORLD_MATRIX),
                      (const float *)device_field(DEVICE_VIEW_MATRIX));
-  matrix4x4_multiply(composite, model_view,
+  compat_d3d_matrix4x4_multiply(composite, model_view,
                      (const float *)device_field(DEVICE_DERIVED_PROJECTION_MATRIX));
   blend = D3D_RENDER_STATE[D3DRS_VERTEXBLEND];
-  p = push_begin(17 + 17 + (blend ? 3 * 17 : 0));
-  p = push_transposed_matrix(p, NV097_SET_MODEL_VIEW_MATRIX, model_view);
-  p = push_transposed_matrix(p, NV097_SET_COMPOSITE_MATRIX, composite);
+  p = compat_d3d_push_begin(17 + 17 + (blend ? 3 * 17 : 0));
+  p = compat_d3d_push_transposed_matrix(p, NV097_SET_MODEL_VIEW_MATRIX, model_view);
+  p = compat_d3d_push_transposed_matrix(p, NV097_SET_COMPOSITE_MATRIX, composite);
   if (blend) {
     for (matrix_index = 0; matrix_index < 3; matrix_index++) {
-      matrix4x4_multiply(
+      compat_d3d_matrix4x4_multiply(
         blended,
         (const float *)device_field(DEVICE_BLEND_MATRIX_1 + matrix_index * 0x40),
         (const float *)device_field(DEVICE_VIEW_MATRIX));
-      p = push_transposed_matrix(p, NV097_SET_MODEL_VIEW_MATRIX + (matrix_index + 1) * 0x40,
+      p = compat_d3d_push_transposed_matrix(p, NV097_SET_MODEL_VIEW_MATRIX + (matrix_index + 1) * 0x40,
                                  blended);
     }
   }
-  push_end(p);
+  compat_d3d_push_end(p);
 
   if (*device_field(DEVICE_TRANSFORM_FLAGS) != 0 ||
       D3D_RENDER_STATE[D3DRS_NORMALIZENORMALS] != 0) {
@@ -2199,7 +2166,7 @@ static void set_state_vb(unsigned long base_vertex_index)
           vs[VS_SLOT(VSD_REG_TEXCOORD0 + i) + VS_SLOT_TYPE] = VS_SLOT_DISABLED;
         }
       }
-      p = push_begin(8);
+      p = compat_d3d_push_begin(8);
       if (!(vs[VS_FLAGS] & VS_FLAG_DIFFUSE)) {
         p[0] = METHOD(NV097_SET_VERTEX_DATA4UB + VSD_REG_DIFFUSE * 4, 1);
         p[1] = DEFAULT_DIFFUSE;
@@ -2220,7 +2187,7 @@ static void set_state_vb(unsigned long base_vertex_index)
         p[1] = DEFAULT_SPECULAR;
         p += 2;
       }
-      push_end(p);
+      compat_d3d_push_end(p);
     }
     last = VS_INPUT_SLOTS - 1;
     while (vs[VS_SLOT(last) + VS_SLOT_TYPE] == VS_SLOT_DISABLED) {
@@ -2230,13 +2197,13 @@ static void set_state_vb(unsigned long base_vertex_index)
       }
     }
     vs[VS_SLOT_COUNT] = last;
-    p = push_begin(17);
+    p = compat_d3d_push_begin(17);
     p[0] = METHOD(NV097_SET_VERTEX_DATA_ARRAY_FORMAT, VS_INPUT_SLOTS);
     for (slot = 0; slot < VS_INPUT_SLOTS; slot++) {
       p[1 + slot] = (STREAM_STRIDE(vs[VS_SLOT(slot) + VS_SLOT_STREAM]) << 8) +
                     vs[VS_SLOT(slot) + VS_SLOT_TYPE];
     }
-    push_end(p + 17);
+    compat_d3d_push_end(p + 17);
   }
   dirty = *device_field(DEVICE_DIRTY);
   if (!(dirty & DIRTY_VERTEX_OFFSETS) &&
@@ -2246,7 +2213,7 @@ static void set_state_vb(unsigned long base_vertex_index)
   vs = current_vertex_shader();
   *device_field(DEVICE_DIRTY) = dirty & 0xbffffdfful;
   *device_field(DEVICE_LAST_BASE_VERTEX_INDEX) = base_vertex_index;
-  p = push_begin(2 * VS_INPUT_SLOTS);
+  p = compat_d3d_push_begin(2 * VS_INPUT_SLOTS);
   last = vs[VS_SLOT_COUNT];
   for (slot = 0; slot <= last; slot++) {
     if (vs[VS_SLOT(slot) + VS_SLOT_TYPE] == VS_SLOT_DISABLED) {
@@ -2265,7 +2232,7 @@ static void set_state_vb(unsigned long base_vertex_index)
     p[1] = address;
     p += 2;
   }
-  push_end(p);
+  compat_d3d_push_end(p);
 }
 
 #define DRAW_ARRAYS_BATCH 0x100
@@ -2285,7 +2252,7 @@ void __stdcall D3DDevice_DrawVertices(uint32_t primitive_type, uint32_t start_ve
   check_begin_not_nested(1, (unsigned long)__builtin_return_address(0));
   set_state_vb(0);
   batches = ((vertex_count - 1) >> 8) + 1;
-  p = push_begin(batches + 5);
+  p = compat_d3d_push_begin(batches + 5);
   p[0] = METHOD(NV097_SET_BEGIN_END, 1);
   p[1] = primitive_type;
   p[2] = METHOD_NONINC(NV097_DRAW_ARRAYS, batches);
@@ -2300,7 +2267,7 @@ void __stdcall D3DDevice_DrawVertices(uint32_t primitive_type, uint32_t start_ve
   p[0] = ((vertex_count - 1) << 24) | start_vertex;
   p[1] = METHOD(NV097_SET_BEGIN_END, 1);
   p[2] = 0;
-  push_end(p + 3);
+  compat_d3d_push_end(p + 3);
 }
 
 #define INDEX_CHUNK_DWORDS 0x1ff
@@ -2338,7 +2305,7 @@ void __stdcall D3DDevice_DrawIndexedVertices(uint32_t primitive_type, uint32_t v
   *device_field(DEVICE_STATE_FLAGS) |= STATE_FLAG_IN_BEGIN_END;
   indices = (const unsigned long *)index_data;
   count = vertex_count;
-  p = push_begin(0x209);
+  p = compat_d3d_push_begin(0x209);
   p[0] = METHOD(NV097_SET_BEGIN_END, 1);
   p[1] = primitive_type;
   p += 2;
@@ -2357,8 +2324,8 @@ void __stdcall D3DDevice_DrawIndexedVertices(uint32_t primitive_type, uint32_t v
     do {
       p = push_index_pairs(p, &indices, chunk);
       count -= chunk * 2;
-      push_end(p);
-      p = push_begin(0x204);
+      compat_d3d_push_end(p);
+      p = compat_d3d_push_begin(0x204);
       chunk = INDEX_CHUNK_DWORDS;
     } while (count >= INDEX_CHUNK_INDICES);
   }
@@ -2370,7 +2337,7 @@ void __stdcall D3DDevice_DrawIndexedVertices(uint32_t primitive_type, uint32_t v
   }
   p[0] = METHOD(NV097_SET_BEGIN_END, 1);
   p[1] = 0;
-  push_end(p + 2);
+  compat_d3d_push_end(p + 2);
   if (*device_field(DEVICE_STATE_FLAGS) & STATE_FLAG_FENCE_PENDING) {
     /* 0x1ed1df: SetFence(1) (0x1ef9e0), not transcribed. */
     halo_standalone_missing("D3D fence after draw (0x1ef9e0)");
@@ -2385,9 +2352,6 @@ void __stdcall D3DDevice_DrawIndexedVertices(uint32_t primitive_type, uint32_t v
 
 #define DEVICE_PIXEL_SHADER_PROGRAM_HANDLE 0x464
 #define D3D_PS_REGISTER_COUNT 0x39
-#define D3DRS_PSTEXTUREMODES 0x74
-#define D3DRS_TEXTUREFACTOR 0x80
-#define D3DTSS_BUMPENVMAT00 0x16
 #define BUMP_ENV_DWORDS 6
 /* The initial combiner input mode of a NULL pixel shader (0x1ec61a). */
 #define OTHER_STAGE_INPUT_DEFAULT 0x210000
@@ -2444,11 +2408,11 @@ static void set_pixel_shader(unsigned long handle)
       *device_field(DEVICE_DIRTY) |= DIRTY_FOG;
     }
     D3DDevice_SetRenderState_TextureFactor(D3D_RENDER_STATE[D3DRS_TEXTUREFACTOR]);
-    p = push_begin(0x17);
+    p = compat_d3d_push_begin(0x17);
     p = push_bump_env(p);
     p[0] = METHOD(NV097_SET_SHADER_OTHER_STAGE_INPUT, 1);
     p[1] = OTHER_STAGE_INPUT_DEFAULT;
-    push_end(p + 2);
+    compat_d3d_push_end(p + 2);
     return;
   }
   def = (const unsigned long *)((const unsigned long *)handle)[2];
@@ -2457,7 +2421,7 @@ static void set_pixel_shader(unsigned long handle)
   *device_field(DEVICE_PS_DOTMAP_TEXTURE_MODES) = def[PSDEF_C0_MAPPING / 4] & PSDEF_DOTMAP_FLAG;
   *device_field(DEVICE_PS_TEXTURE_MODES) = def[PSDEF_TEXTURE_MODES / 4];
   *device_field(DEVICE_DIRTY) |= DIRTY_TEXTURE_MODES;
-  p = push_begin(0x54);
+  p = compat_d3d_push_begin(0x54);
   if (old == 0) {
     p = push_bump_env(p);
   }
@@ -2488,7 +2452,7 @@ static void set_pixel_shader(unsigned long handle)
     p[2] = def[PSDEF_FINAL_INPUTS_1 / 4];
     p += 3;
   }
-  push_end(p);
+  compat_d3d_push_end(p);
   if (!(*device_field(DEVICE_STATE_FLAGS) & STATE_FLAG_NO_SHADOW)) {
     for (i = 0; i < D3D_PS_REGISTER_COUNT; i++) {
       D3D_RENDER_STATE[i] = def[i];
@@ -2518,9 +2482,6 @@ void __stdcall D3DDevice_SetPixelShaderProgram(void *program)
  */
 
 #define TEXTURE_FORMAT_MODE_MASK 0xf4
-#define SURFACE_SIZE_DIMENSION_MASK 0xfff
-#define SURFACE_SIZE_PITCH_SHIFT 24
-#define SURFACE_PITCH_UNIT 64
 #define D3DCOMMON_PALETTESIZE_SHIFT 28
 
 /* 0x1e8700 */
@@ -2541,17 +2502,17 @@ void __stdcall D3DDevice_SetTexture(uint32_t stage, void *texture)
   t = (unsigned long *)texture;
   *device_field(DEVICE_TEXTURES + stage * 4) = (unsigned long)t;
   if (!t) {
-    p = push_begin(2);
+    p = compat_d3d_push_begin(2);
     p[0] = METHOD(NV097_SET_TEXTURE_CONTROL0 + stage * 0x40, 1);
     p[1] = 0;
-    push_end(p + 2);
+    compat_d3d_push_end(p + 2);
     TRACE_CONTROL0(stage, 0);
     *device_field(DEVICE_TEXTURE_FORMAT_BITS + stage * 4) = 0xfffffffful;
     *device_field(DEVICE_DIRTY) |= DIRTY_TEXTURE_MODES | DIRTY_COMBINERS;
     return;
   }
   resource_add_device_ref(t);
-  p = push_begin(9);
+  p = compat_d3d_push_begin(9);
   p[0] = METHOD(NV097_SET_TEXTURE_OFFSET + stage * 0x40, 2);
   p[1] = t[RESOURCE_DATA];
   p[2] = t[RESOURCE_FORMAT];
@@ -2579,7 +2540,7 @@ void __stdcall D3DDevice_SetTexture(uint32_t stage, void *texture)
       *device_field(DEVICE_DIRTY) |= DIRTY_COMBINERS;
     }
   }
-  push_end(p);
+  compat_d3d_push_end(p);
 }
 
 /* 0x1e88a0 */
@@ -2599,10 +2560,10 @@ void __stdcall D3DDevice_SetPalette(uint32_t stage, void *palette)
     return;
   }
   resource_add_device_ref(pal);
-  p = push_begin(2);
+  p = compat_d3d_push_begin(2);
   p[0] = METHOD(NV097_SET_TEXTURE_PALETTE + stage * 0x40, 1);
   p[1] = pal[RESOURCE_DATA] | (pal[RESOURCE_COMMON] >> D3DCOMMON_PALETTESIZE_SHIFT);
-  push_end(p + 2);
+  compat_d3d_push_end(p + 2);
 }
 
 /* 0x1fb3d8: dirty bits of the deferred texture-stage states 0..0x15. */
@@ -2693,10 +2654,10 @@ void __stdcall D3DDevice_Begin(uint32_t primitive_type)
   *IMMEDIATE_PRIMITIVE = primitive_type;
   lazy_set_state();
   TRACE_DRAW("begin");
-  p = push_begin(2);
+  p = compat_d3d_push_begin(2);
   p[0] = METHOD(NV097_SET_BEGIN_END, 1);
   p[1] = primitive_type;
-  push_end(p + 2);
+  compat_d3d_push_end(p + 2);
   *device_field(DEVICE_STATE_FLAGS) |= STATE_FLAG_IN_BEGIN_END;
 }
 
@@ -2706,10 +2667,10 @@ void D3DDevice_End(void)
   uint32_t *p;
 
   *IMMEDIATE_PRIMITIVE = 0;
-  p = push_begin(2);
+  p = compat_d3d_push_begin(2);
   p[0] = METHOD(NV097_SET_BEGIN_END, 1);
   p[1] = 0;
-  push_end(p + 2);
+  compat_d3d_push_end(p + 2);
   if (*device_field(DEVICE_STATE_FLAGS) & STATE_FLAG_FENCE_PENDING) {
     /* 0x1ed4c3: SetFence(1) (0x1ef9e0), not transcribed. */
     halo_standalone_missing("D3D fence after draw (0x1ef9e0)");
@@ -2725,11 +2686,11 @@ void __stdcall D3DDevice_SetVertexData2f(uint32_t reg, float a, float b)
 
   check_vertex_inside_begin(reg, (unsigned long)__builtin_return_address(0));
 
-  p = push_begin(3);
+  p = compat_d3d_push_begin(3);
   p[0] = METHOD(NV097_SET_VERTEX_DATA2F_M + reg * 8, 2);
   p[1] = float_bits(a);
   p[2] = float_bits(b);
-  push_end(p + 3);
+  compat_d3d_push_end(p + 3);
 }
 
 /* 0x1ed2c0: register -1 is the vertex itself (NV097_SET_VERTEX4F). */
@@ -2739,7 +2700,7 @@ void __stdcall D3DDevice_SetVertexData4f(uint32_t reg, float a, float b, float c
 
   check_vertex_inside_begin(reg, (unsigned long)__builtin_return_address(0));
 
-  p = push_begin(5);
+  p = compat_d3d_push_begin(5);
   if (reg == 0xfffffffful) {
     p[0] = METHOD(NV097_SET_VERTEX4F, 4);
   } else {
@@ -2749,7 +2710,7 @@ void __stdcall D3DDevice_SetVertexData4f(uint32_t reg, float a, float b, float c
   p[2] = float_bits(b);
   p[3] = float_bits(c);
   p[4] = float_bits(d);
-  push_end(p + 5);
+  compat_d3d_push_end(p + 5);
 }
 
 /* 0x1ed320 */
@@ -2759,10 +2720,10 @@ void __stdcall D3DDevice_SetVertexData2s(unsigned int reg, int a, int b)
 
   check_vertex_inside_begin(reg, (unsigned long)__builtin_return_address(0));
 
-  p = push_begin(2);
+  p = compat_d3d_push_begin(2);
   p[0] = METHOD(NV097_SET_VERTEX_DATA2S + reg * 4, 1);
   p[1] = ((unsigned long)(long)(short)b << 16) | ((unsigned long)a & 0xffff);
-  push_end(p + 2);
+  compat_d3d_push_end(p + 2);
 }
 
 /* 0x1ed3b0 */
@@ -2773,10 +2734,10 @@ void __stdcall D3DDevice_SetVertexData4ub(uint32_t reg, uint32_t r, uint32_t g, 
 
   check_vertex_inside_begin(reg, (unsigned long)__builtin_return_address(0));
 
-  p = push_begin(2);
+  p = compat_d3d_push_begin(2);
   p[0] = METHOD(NV097_SET_VERTEX_DATA4UB + reg * 4, 1);
   p[1] = ((a & 0xff) << 24) | ((b & 0xff) << 16) | ((g & 0xff) << 8) | (r & 0xff);
-  push_end(p + 2);
+  compat_d3d_push_end(p + 2);
 }
 
 /* 0x1ed400: D3DCOLOR (ARGB) to the RGBA byte order of the method. */
@@ -2786,10 +2747,10 @@ void __stdcall D3DDevice_SetVertexDataColor(unsigned int reg, unsigned int color
 
   check_vertex_inside_begin(reg, (unsigned long)__builtin_return_address(0));
 
-  p = push_begin(2);
+  p = compat_d3d_push_begin(2);
   p[0] = METHOD(NV097_SET_VERTEX_DATA4UB + reg * 4, 1);
   p[1] = (color & 0xff00ff00ul) | ((color & 0xff) << 16) | ((color >> 16) & 0xff);
-  push_end(p + 2);
+  compat_d3d_push_end(p + 2);
 }
 
 /* ------------------------------------------------------------------------
@@ -2845,18 +2806,20 @@ static const unsigned char default_texture_states[DEFAULT_TEXTURE_STATE_COUNT] =
   0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, /* 0x10 */
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, /* 0x18 */
 };
-#define D3DRS_ZENABLE 0x7b
-/* 0x1f3000: the device's default state. The identity transforms it sets
- * first (SetTransform 0..9 with 0x1f9f48) are already in place from
- * Direct3D_CreateDevice. D3DRS_ZENABLE follows the depth buffer: the XDK
- * tests its auto depth-stencil (device+0x2198), the compat device the
- * current depth buffer at device+0x410. */
+
+/* 0x1f3000: the device's default state, starting with identity transforms.
+ * D3DRS_ZENABLE follows the depth buffer: the XDK tests its auto
+ * depth-stencil (device+0x2198), the compat device the current depth buffer
+ * at device+0x410. */
 static void set_default_state(void)
 {
   unsigned long i;
   unsigned long stage;
   unsigned long state;
 
+  for (i = 0; i < D3DTS_COUNT; i++) {
+    D3DDevice_SetTransform(i, (void *)compat_d3d_identity_matrix);
+  }
   for (i = 0; i < DEFAULT_RENDER_STATE_COUNT; i++) {
     if (DEFAULT_RENDER_STATE_FIRST + i == DEFAULT_RENDER_STATE_SKIPPED) {
       continue;

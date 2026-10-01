@@ -17,6 +17,9 @@
  *                  FUN_00236210's sizes; a bundle is rewound whenever all of
  *                  its values were consumed, so a buffer only needs to hold
  *                  one run (1 << len values) instead of a whole plane.
+ *
+ * Modified for halo-xbox-runtime; the git history records each change and
+ * its date.
  */
 #include "internal.h"
 #include "tables.h"
@@ -440,20 +443,28 @@ static void read_dcs(struct context *c, struct bundle *b, int has_sign)
   b->cur_dec = (unsigned char *)dst;
 }
 
+/* Only values read_* decoded: a corrupt stream that consumes more gets 0
+ * instead of walking cur_ptr off the bundle. */
 static int get_value(struct context *c, int n)
 {
   struct bundle *b = &c->bundle[n];
   int v;
 
-  if (n < SRC_X_OFF || n == SRC_RUN) {
-    return *b->cur_ptr++;
+  if (n == SRC_INTRA_DC || n == SRC_INTER_DC) {
+    if (!b->cur_dec || b->cur_dec - b->cur_ptr < 2) {
+      return 0;
+    }
+    v = *(const bink_s16 *)b->cur_ptr;
+    b->cur_ptr += 2;
+    return v;
+  }
+  if (!b->cur_dec || b->cur_ptr >= b->cur_dec) {
+    return 0;
   }
   if (n == SRC_X_OFF || n == SRC_Y_OFF) {
     return (signed char)*b->cur_ptr++;
   }
-  v = *(const bink_s16 *)b->cur_ptr;
-  b->cur_ptr += 2;
-  return v;
+  return *b->cur_ptr++;
 }
 
 static int read_coef(struct bitreader *gb, int bits)

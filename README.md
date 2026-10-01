@@ -5,7 +5,8 @@ projects. The current backend targets original Xbox through
 [nxdk](https://github.com/XboxDev/nxdk).
 
 This repository contains XDK compatibility layers
-(`compat/`, one folder per library), CRT fixups (`crt/`), the runtime entry (`standalone_runtime.c`),
+(`compat/`, one folder per library, with the entry point in `compat/xapi/init.c`), CRT fixups
+(`crt/`), bring-up runtime support (`standalone_runtime.c`),
 and the build and debug tools (`tools/`). The game code, `kb.json` and the
 reference build tooling come from a halo checkout, which you point at with
 `HALO_ROOT`. Any halo checkout or worktree works.

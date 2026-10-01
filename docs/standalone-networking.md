@@ -47,6 +47,9 @@ LAN key into the build; runtime kernel keys are not copied into the image.
 Random generation persists a rekeyed device-keyed seed on T: before returning
 bytes and fails on missing device-key or storage errors. Startup flag 1 allows
 plain LAN IPv4 traffic; secure mappings and discovery remain encrypted.
+While XNet is started, inbound filtering fails closed: besides ARP, secure
+startup admits only the stack's DHCP replies in plaintext, and no plaintext
+frame may claim a virtual 0/8 source or destination under either flag.
 
 The recovered catalog reverses the names of the original socket-address
 queries: 0x22486b returns the local bound address, while 0x224876 returns the
@@ -105,6 +108,7 @@ pyxbe, Unicorn and cryptography in addition to OpenSSL development headers.
 kernel/NIC/scheduling shims and tests the production packet adapter: encrypted
 discovery without DHCP, inbound checksum/integrity checks, loopback delivery,
 TCP SYN routing to secure peers, encrypted discovery under startup flag 1,
+fail-closed plaintext filtering (forged ports and virtual sources),
 a local TCP server on port 5150, and shared-NIC buffer ownership, title/debug
 address separation, driver selection, and link updates. It uses the production
 lwIP options rather than independently chosen routing defaults.

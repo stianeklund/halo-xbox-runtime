@@ -22,7 +22,7 @@
  * A save game is the directory <root><12 hex digits of a 48-bit hash of the
  * name> holding SaveMeta.xbx, a UTF-16 "Name=<name>\r\n" file. The root Halo
  * passes is "u:\" (the wide string at 0x2ba7e0), the title's user-data drive
- * that xapi_init.c maps like XapiInitProcess.
+ * that init.c maps like XapiInitProcess.
  *
  * The file APIs the originals call through XAPI (CreateFileA, ReadFile,
  * WriteFile, SetFilePointer, CreateDirectoryA, RemoveDirectoryA,
