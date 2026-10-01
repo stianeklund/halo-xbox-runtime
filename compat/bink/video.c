@@ -52,6 +52,11 @@ enum {
 #define DC_START_BITS 11
 #define VLC_BITS 7
 
+/* Unbounded: FUN_00238070 receives no input length. A corrupt frame can make
+ * it read past the frame data, but writes stay in bounds (bundles stop at
+ * data_end, motion references are checked, GotoFrame rejects frames larger
+ * than compframe). The movies ship with the game and are trusted like the
+ * XBE itself. */
 struct bitreader {
   const unsigned char *data;
   unsigned long pos;

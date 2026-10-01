@@ -1458,6 +1458,9 @@ void D3DDevice_BeginVisibilityTest(void)
 {
   uint32_t *p;
 
+  if (!d3d_pbkit_ready) {
+    return;
+  }
   p = compat_d3d_push_reserve(4);
   p = pb_push1(p, NV097_CLEAR_REPORT_VALUE,
                NV097_CLEAR_REPORT_VALUE_TYPE_ZPASS_PIXEL_CNT);
@@ -1474,6 +1477,15 @@ int __stdcall D3DDevice_EndVisibilityTest(unsigned int index)
   report = visibility_report_get(index);
   if (report == NULL) {
     return E_OUTOFMEMORY;
+  }
+  /* Without pbkit nothing was drawn and no GPU will write the report:
+   * complete it with no pixels, or the game polls it forever. */
+  if (!d3d_pbkit_ready) {
+    *(unsigned long *)((unsigned char *)report +
+                       VISIBILITY_REPORT_RESULT_OFFSET) = 0;
+    *(unsigned long *)((unsigned char *)report +
+                       VISIBILITY_REPORT_STATUS_OFFSET) = 0;
+    return D3D_OK;
   }
   /* Arm the slot here only: the GPU clears the status word when it writes
    * the report, and GetVisibilityTestResult polls it. Re-arming on every
