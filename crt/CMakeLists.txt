@@ -28,13 +28,20 @@ set(USB_DIR "${NXDK_DIR}/lib/usb")
 set(USB_HID_SOURCES
 	"${USB_DIR}/libusbohci/src_hid/hid_core.c"
 	"${USB_DIR}/libusbohci/src_hid/hid_driver.c")
-target_sources(standalone_crt PRIVATE nxdk_keyboard.c nxdk_usb.c ${USB_HID_SOURCES})
-set_property(SOURCE nxdk_keyboard.c ${USB_HID_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
+# nxdk_usb.lib's XID driver holds 4 devices, so xemu's debug keyboard leaves
+# room for only three pads. This copy defines every symbol of the library's
+# xid_driver.obj, so the linker never pulls that member in.
+set(USB_XID_SOURCES "${USB_DIR}/libusbohci_xbox/xid_driver.c")
+target_sources(standalone_crt PRIVATE nxdk_keyboard.c nxdk_usb.c ${USB_HID_SOURCES}
+	${USB_XID_SOURCES})
+set_property(SOURCE nxdk_keyboard.c ${USB_HID_SOURCES} ${USB_XID_SOURCES} APPEND PROPERTY
+	COMPILE_OPTIONS
 	"-I${USB_DIR}/libusbohci/inc" "-I${USB_DIR}/libusbohci_xbox"
 	"-DUSBH_USE_EXTERNAL_CONFIG=\"usbh_config_xbox.h\""
 	"-Dsysprintf=standalone_hid_log" "-Dget_ticks=usbh_get_ticks")
+set_property(SOURCE ${USB_XID_SOURCES} APPEND PROPERTY COMPILE_DEFINITIONS CONFIG_XID_MAX_DEV=8)
 set_target_properties(standalone_crt PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
-# Our sources build warning-clean like the game's; nxdk's HID and nxdk-audio
+# Our sources build warning-clean like the game's; nxdk's HID, XID and nxdk-audio
 # sources, and pdclib_open.c (which includes nxdk's _PDCLIB_open.c), are
 # compiled as they come.
 set(CRT_OWN_SOURCES msvc_print.c nxdk_net.c nxdk_debug_net.c nxdk_xnet.c
