@@ -840,12 +840,81 @@ typedef struct {
   unsigned long max_z;
 } d3d_viewport;
 
+/* D3DRECT */
+typedef struct {
+  long x1;
+  long y1;
+  long x2;
+  long y2;
+} d3d_rect;
+
+#define DEVICE_SCISSOR_RECTS 0x227c
+#define DEVICE_SCISSOR_COUNT 0x22fc
+#define DEVICE_SCISSOR_EXCLUSIVE 0x2300
+
+/* 0x1e9000 (`ret 0xc`). Count 0 means one inclusive rect covering the
+ * current viewport. Each rect is scaled by the super-sample factors, offset
+ * by 0.5 and truncated (cvttss2si, 0x1f3c30) into window-clip region i; the
+ * NV2A copies a region write into every later region too. The rects are
+ * cached at device+0x227c. Without this the split-screen windows are not
+ * clipped to their viewports and draw over each other. */
+void __stdcall D3DDevice_SetScissors(unsigned long count, int exclusive,
+                                     const void *rects)
+{
+  const unsigned long *d;
+  const d3d_rect *r;
+  d3d_rect viewport_rect;
+  uint32_t *p;
+  float scale_x;
+  float scale_y;
+  float lo;
+  unsigned long i;
+  long x1;
+  long x2;
+  long y1;
+  long y2;
+
+  d = D3D_DEVICE;
+  r = (const d3d_rect *)rects;
+  if (count == 0) {
+    viewport_rect.x1 = (long)d[DEVICE_VIEWPORT / 4 + 0];
+    viewport_rect.y1 = (long)d[DEVICE_VIEWPORT / 4 + 1];
+    viewport_rect.x2 = viewport_rect.x1 + (long)d[DEVICE_VIEWPORT / 4 + 2];
+    viewport_rect.y2 = viewport_rect.y1 + (long)d[DEVICE_VIEWPORT / 4 + 3];
+    count = 1;
+    exclusive = 0;
+    r = &viewport_rect;
+  }
+  p = compat_d3d_push_begin(2 + count * 4);
+  p[0] = METHOD(NV097_SET_WINDOW_CLIP_TYPE, 1);
+  p[1] = (uint32_t)exclusive;
+  p += 2;
+  scale_x = ((const dword_float *)device_field(DEVICE_SUPER_SAMPLE_SCALE_X))->f;
+  scale_y = ((const dword_float *)device_field(DEVICE_SUPER_SAMPLE_SCALE_Y))->f;
+  for (i = 0; i < count; i++) {
+    lo = (float)r[i].x1 * scale_x;
+    x2 = (long)((float)r[i].x2 * scale_x + 0.5f);
+    x1 = (long)(lo + 0.5f);
+    p[0] = METHOD(NV097_SET_WINDOW_CLIP_HORIZONTAL + i * 4, 1);
+    p[1] = (uint32_t)x1 | ((uint32_t)(x2 - 1) << 16);
+    lo = (float)r[i].y1 * scale_y;
+    y2 = (long)((float)r[i].y2 * scale_y + 0.5f);
+    y1 = (long)(lo + 0.5f);
+    p[2] = METHOD(NV097_SET_WINDOW_CLIP_VERTICAL + i * 4, 1);
+    p[3] = (uint32_t)y1 | ((uint32_t)(y2 - 1) << 16);
+    p += 4;
+  }
+  compat_d3d_push_end(p);
+  memcpy(device_field(DEVICE_SCISSOR_RECTS), r, count * sizeof(d3d_rect));
+  *device_field(DEVICE_SCISSOR_COUNT) = count;
+  *device_field(DEVICE_SCISSOR_EXCLUSIVE) = (unsigned long)exclusive;
+}
+
 /* 0x1e82a0: clips the viewport to the render target (the back buffer is
  * measured through the front buffer header) and stores it at device+0xb00,
  * where GetViewport reads it. The original then pushes the transform:
- * D3D_UpdateProjectionViewportTransform (called), D3DDevice_SetScissors(0,
- * 0, 0) (not called: its kb decl is a void(void) placeholder over a 3-argument
- * __stdcall) and the viewport push of FUN_001e9db0 (draw.c). */
+ * D3D_UpdateProjectionViewportTransform, D3DDevice_SetScissors(0, 0, 0) and
+ * the viewport push of FUN_001e9db0 (draw.c). */
 void __stdcall D3DDevice_SetViewport(void *viewport)
 {
   const d3d_viewport *vp;
@@ -878,6 +947,7 @@ void __stdcall D3DDevice_SetViewport(void *viewport)
   d[DEVICE_VIEWPORT / 4 + 4] = vp->min_z;
   d[DEVICE_VIEWPORT / 4 + 5] = vp->max_z;
   D3D_UpdateProjectionViewportTransform();
+  D3DDevice_SetScissors(0, 0, NULL);
   compat_d3d_push_viewport();
   d[DEVICE_DIRTY / 4] |= 1;
 }
