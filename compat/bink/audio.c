@@ -1,4 +1,6 @@
 /*
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
  * Standalone compat: Bink audio decoder (RAD's FUN_0023cd10/FUN_0023ce50/
  * FUN_0023ec50), the RDFT variant every Bink 1 file carries.
  *

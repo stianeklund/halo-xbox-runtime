@@ -45,4 +45,13 @@ the repo. Copy them from the title's `media` directory. The whole of
 
 `video.c`, `audio.c` and `tables.h` are derived from FFmpeg's `libavcodec/bink.c`,
 `binkaudio.c` and `binkdata.h`, which are LGPL-2.1-or-later. Each of them
-keeps that notice. The other files are original to this repo. No RAD code or data is included.
+keeps that notice. The full license is in
+[`LICENSES/LGPL-2.1-or-later.txt`](../LICENSES/LGPL-2.1-or-later.txt).
+The original contributions in the other compatibility files use the project's
+GPL-3.0-only license; see [`LICENSE`](../LICENSE).
+
+The project license does not replace the decoder's LGPL license or upstream
+copyright notices. When distributing a linked executable, include the applicable
+license texts and corresponding source, including the decoder modifications and
+build scripts. External Halo sources and data retain their existing rights;
+the project license does not grant permission to redistribute them.

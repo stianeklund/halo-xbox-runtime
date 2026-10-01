@@ -1,4 +1,6 @@
 /*
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
  * Standalone compat: Bink 1 video decoder (RAD's FUN_00236210/FUN_00238070).
  *
  * Halo's decompiled Bink front end (halo/src/halo/bink) calls these RAD

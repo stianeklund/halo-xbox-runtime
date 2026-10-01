@@ -1,4 +1,6 @@
-/* Bink 1 bitstream tables (scan order, 4-bit Huffman trees, run patterns and
+/* SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ * Bink 1 bitstream tables (scan order, 4-bit Huffman trees, run patterns and
  * DCT quantizers). Values are those of FFmpeg libavcodec/binkdata.h
  * (LGPL-2.1-or-later, Konstantin Shishkov); see compat/bink/video.c. */
 #ifndef HALO_BINK_TABLES_H

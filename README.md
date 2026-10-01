@@ -34,3 +34,18 @@ Use `HALO_STANDALONE_AUDIO_BACKEND=software ./build.sh` or
 
 See [docs/standalone-build.md](docs/standalone-build.md) for the design, the
 seeded bring-up variant, the boot-test loop and the status.
+
+## License
+
+Unless a file states otherwise, original contributions to halo-nxdk are
+licensed under the **GNU General Public License, version 3 only**
+(`GPL-3.0-only`). See [LICENSE](LICENSE) for the full terms.
+
+The FFmpeg-derived Bink decoder files retain their **LGPL-2.1-or-later**
+license and copyright notices; see [docs/bink.md](docs/bink.md#license) and
+[the LGPL text](LICENSES/LGPL-2.1-or-later.txt). Other third-party code and
+dependencies retain their respective licenses.
+
+This license grant covers the project's original contributions. It does not
+grant rights to external Halo game code, assets, proprietary SDK code, or
+data copied from an original XBE by the seeded build.
