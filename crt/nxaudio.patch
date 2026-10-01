@@ -10,7 +10,16 @@
  static void *g_hw_hrtf_targets = NULL;
  static void *g_hw_hrtf_currents = NULL;
  nxAudioVoice *g_tracked_voices[MCPX_HW_MAX_VOICES];
-@@ -41,7 +44,7 @@
+@@ -24,6 +27,8 @@
+ static KINTERRUPT g_apu_interrupt;
+ static KDPC g_apu_dpc;
+ static bool g_isr_dpc_initialized = false;
++static HAL_SHUTDOWN_REGISTRATION g_shutdown_registration;
++static bool g_shutdown_registered = false;
+ static ac97_descriptor_t spdif_output_descriptor[1];
+ static ac97_descriptor_t pcm_output_descriptor[1];
+ 
+@@ -41,7 +46,7 @@
  #ifndef __INTELLISENSE__
  #ifndef __clang_analyzer__
  static const char passthrough_text[] = {
@@ -19,7 +28,7 @@
      , '\0'};
  #endif
  #endif
-@@ -96,9 +99,11 @@
+@@ -96,9 +101,11 @@
  
                  // Parse the 4-digit address and 6-digit opcode as hex (%x)
                  if (sscanf(line, "P %x %x", &address, &opcode) == 2) {
@@ -33,7 +42,7 @@
                      }
                  }
              }
-@@ -293,8 +298,15 @@
+@@ -293,8 +300,15 @@
                      if (!buffer) {
                          continue;
                      }
@@ -50,7 +59,7 @@
                          voice->buffers_hardware[j] = NULL;
                          if (voice->callback) {
                              voice->callback(voice, voice->user_context);
-@@ -325,6 +337,43 @@
+@@ -325,6 +339,59 @@
      return g_last_error;
  }
  
@@ -91,10 +100,26 @@
 +    return scratch;
 +}
 +
++// A reboot that skips nxAudioShutdown leaves the APU running through memory the next boot reuses: the GP would read
++// commands from it and write effect data to it. Stop the AC97, the sound engine and both DSPs, as retail DirectSound's
++// shutdown notification does.
++static VOID NTAPI apu_shutdown_notification (PHAL_SHUTDOWN_REGISTRATION registration)
++{
++    (void)registration;
++    volatile ac97_busmaster_regs_t *bm = (ac97_busmaster_regs_t *)AC97_BUSMASTER_MMIO;
++    bm->spdif_control = AC97_BM_CR_RESET;
++    bm->pcm_out_control = AC97_BM_CR_RESET;
++    apu_write_reg(NV_PAPU_IEN, 0x00000000);
++    apu_write_reg(NV_PAPU_FECTL, 0);
++    apu_write_reg(NV_PAPU_SECTL, 0);
++    apu_write_reg(APU_GP_OFFSET + NV_PAPU_GPRST, 0x00000000);
++    apu_write_reg(APU_EP_OFFSET + NV_PAPU_GPRST, 0x00000000);
++}
++
  bool nxAudioInit (const nxAudioInitParams *parameters)
  {
      (void)parameters;
-@@ -566,6 +615,8 @@
+@@ -566,6 +633,8 @@
          g_hw_gp_sges[0].length_and_format = PAGE_SIZE;
          g_hw_gp_sges[1].phys_addr = MmGetPhysicalAddress(g_hw_gp_pmem) + PAGE_SIZE;
          g_hw_gp_sges[1].length_and_format = PAGE_SIZE;
@@ -103,7 +128,31 @@
      }
  
      // Enable GP which automatically reads in the DSP code (Now setup in NV_PAPU_GPSADDR)
-@@ -627,6 +678,11 @@
+@@ -585,6 +654,11 @@
+     KeConnectInterrupt(&g_apu_interrupt);
+     g_isr_dpc_initialized = true;
+ 
++    g_shutdown_registration.NotificationRoutine = apu_shutdown_notification;
++    g_shutdown_registration.Priority = 0;
++    HalRegisterShutdownNotification(&g_shutdown_registration, TRUE);
++    g_shutdown_registered = true;
++
+     // Start the Sound Engine
+     apu_write_reg(NV_PAPU_SECTL, 0x0000000F);
+ 
+@@ -596,6 +670,11 @@
+ 
+ void nxAudioShutdown (void)
+ {
++    if (g_shutdown_registered) {
++        HalRegisterShutdownNotification(&g_shutdown_registration, FALSE);
++        g_shutdown_registered = false;
++    }
++
+     volatile ac97_busmaster_regs_t *bm = (ac97_busmaster_regs_t *)AC97_BUSMASTER_MMIO;
+     bm->spdif_control = AC97_BM_CR_RESET;
+     bm->pcm_out_control = AC97_BM_CR_RESET;
+@@ -627,6 +706,11 @@
      APU_FREE(g_hw_gp_sges);
      APU_FREE(g_hw_vp_sges);
      APU_FREE(g_hw_gp_fifos);
@@ -115,7 +164,7 @@
      APU_FREE(g_hw_gp_pmem);
      APU_FREE(g_hw_hrtf_targets);
      APU_FREE(g_hw_hrtf_currents);
-@@ -693,7 +749,7 @@
+@@ -693,7 +777,7 @@
      }
  
      // Snap azimuth to nearest 5-degree grid point
