@@ -2713,6 +2713,22 @@ void D3DDevice_End(void)
                                                        STATE_FLAG_FENCE_PENDING);
 }
 
+/* Not XDK behavior: called from the exception filter, before
+ * halt_and_catch_fire draws. An exception between a Begin (immediate or
+ * DrawIndexedVertices) and its End leaves the batch open on the GPU, and the
+ * error screen's first draw lands in it: xemu ignores the nested Begin and
+ * asserts when the mixed batch is flushed (inline_buffer_length == 0 in
+ * pgraph_vk_flush_draw). Close it. A push the exception cut short was never
+ * committed, so the End overwrites it. */
+void compat_d3d_close_open_begin(void)
+{
+  if (*device_field(DEVICE_STATE_FLAGS) & STATE_FLAG_IN_BEGIN_END) {
+    DbgPrint("[d3d] closing Begin left open by an exception: opener=%08lx\n",
+             d3d_begin_opener);
+    D3DDevice_End();
+  }
+}
+
 /* 0x1ed280 */
 void __stdcall D3DDevice_SetVertexData2f(uint32_t reg, float a, float b)
 {
