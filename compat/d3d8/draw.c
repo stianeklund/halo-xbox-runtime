@@ -160,9 +160,17 @@ static const unsigned long passthrough_program_1fa140[0x30] = {
 #define PUSH_BUFFER_BYTES (4ul * 1024 * 1024)
 #define PUSH_REWIND_MARGIN_DWORDS (64ul * 1024 / 4)
 #define PUSH_SCRATCH_DWORDS 0x2000
+/* The XDK writes at its own put pointer and starts DMA from CDevice_KickOff
+ * (0x1ef930): Present, EndVisibilityTest, SetFence, and MakeSpace when the
+ * written span passes the threshold. Kick in the same places, with a fixed
+ * span standing in for MakeSpace, instead of on every push: each pb_end
+ * flushes the write-combine cache and spins on its MMIO status. */
+#define PUSH_KICK_DWORDS (8ul * 1024 / 4)
 
 static uint32_t push_scratch[PUSH_SCRATCH_DWORDS];
 static uint32_t *push_head;
+static uint32_t *push_cursor;
+static uint32_t *push_kicked;
 static uint32_t *push_limit;
 static int push_dropped;
 
@@ -170,6 +178,25 @@ static int push_dropped;
 unsigned long compat_d3d_push_buffer_bytes(void)
 {
   return PUSH_BUFFER_BYTES;
+}
+
+/* Hand everything written since the last kick to the GPU. Waits for the GPU
+ * and anything that reads what it writes must follow a kick. */
+void compat_d3d_push_kick(void)
+{
+  if (push_cursor != push_kicked) {
+    pb_begin();
+    pb_end(push_cursor);
+    push_kicked = push_cursor;
+  }
+}
+
+/* Kick, then wait until the GPU has fetched and executed everything. */
+void compat_d3d_push_drain(void)
+{
+  compat_d3d_push_kick();
+  while (pb_busy()) {
+  }
 }
 
 /* pb_reset and remember where the buffer starts again. Called after pb_init
@@ -184,12 +211,13 @@ void compat_d3d_push_rewind(void)
 {
   uint32_t *p;
 
-  while (pb_busy()) {
-  }
+  compat_d3d_push_drain();
   pb_reset();
   p = pb_begin();
   pb_end(p);
   push_head = p;
+  push_cursor = p;
+  push_kicked = p;
 }
 
 /* Not XDK behavior: bring-up diagnostic. pbkit (like the XDK) is not thread
@@ -215,13 +243,16 @@ static uint32_t *push_reserve(unsigned long dwords, unsigned long caller)
   uint32_t *p;
 
   check_push_thread(caller);
-  p = pb_begin();
+  if (!push_cursor) {
+    push_cursor = pb_begin();
+    push_kicked = push_cursor;
+  }
+  p = push_cursor;
   if (push_head &&
       (unsigned long)(p - push_head) + dwords + PUSH_REWIND_MARGIN_DWORDS >
         PUSH_BUFFER_BYTES / 4) {
-    pb_end(p);
     compat_d3d_push_rewind();
-    p = pb_begin();
+    p = push_cursor;
   }
   push_limit = p + dwords;
   push_dropped = 0;
@@ -252,7 +283,10 @@ void compat_d3d_push_end(uint32_t *end)
     halo_standalone_missing("d3d8_draw: push ran past its reservation");
   }
   if (!push_dropped) {
-    pb_end(end);
+    push_cursor = end;
+    if ((unsigned long)(push_cursor - push_kicked) >= PUSH_KICK_DWORDS) {
+      compat_d3d_push_kick();
+    }
   }
 }
 

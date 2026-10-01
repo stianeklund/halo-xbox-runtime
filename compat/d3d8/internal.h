@@ -108,6 +108,8 @@ uint32_t *compat_d3d_push_reserve(unsigned long dwords);
 uint32_t *compat_d3d_push_begin(unsigned long dwords);
 void compat_d3d_push_end(uint32_t *end);
 unsigned long compat_d3d_push_buffer_bytes(void);
+void compat_d3d_push_kick(void);
+void compat_d3d_push_drain(void);
 void compat_d3d_push_rewind(void);
 void compat_d3d_push_viewport(void);
 void compat_d3d_push_passthrough_program(void);

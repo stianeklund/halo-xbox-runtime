@@ -33,6 +33,7 @@ void XVideoSetVideoEnable(int enable);
 int pb_init(void);
 unsigned long pb_wait_for_vbl(void);
 void pb_wait_until_gr_not_busy(void);
+int pb_busy(void);
 void pb_size(unsigned long size);
 void pb_set_surface_allocation(int enable);
 uint32_t *pb_push1(uint32_t *p, unsigned long command, unsigned long param1);
@@ -219,6 +220,11 @@ static unsigned long *d3d_render_target;
 static unsigned long *d3d_depth_stencil;
 static unsigned char *d3d_idle_framebuffer;
 static void *d3d_visibility_report_pages[16];
+/* Xbox D3DLOCK flags */
+#define D3DLOCK_NOFLUSH 0x10
+#define D3DLOCK_NOOVERWRITE 0x20
+#define D3DLOCK_READONLY 0x80
+
 static int d3d_pbkit_ready;
 static int d3d_targets_dirty;
 /* Vertical blanks each frame stays on screen; 0 flips without waiting. */
@@ -990,6 +996,7 @@ int __stdcall Direct3D_CreateDevice(uint32_t adapter, uint32_t device_type,
       gpu_clear(0, D3DCLEAR_TARGET_R | D3DCLEAR_TARGET_G |
                      D3DCLEAR_TARGET_B | D3DCLEAR_TARGET_A, 0, 0);
     }
+    compat_d3d_push_kick();
     pb_wait_until_gr_not_busy();
   }
   XVideoSetFB((unsigned char *)buffer_surface(DEVICE_FRONT_BUFFER_SLOT)[1]);
@@ -1129,9 +1136,49 @@ int __stdcall D3DDevice_CreatePalette(uint32_t size, void **out_palette)
   return D3D_OK;
 }
 
+/* D3D_BlockOnResource (0x1efd80) waits for the GPU fence of the resource.
+ * No fences are kept here, so wait for all queued GPU work instead. */
+static void block_on_resource(void)
+{
+  if (d3d_pbkit_ready) {
+    compat_d3d_push_drain();
+  }
+}
+
+/* 0x1e6fb0: jmp CDevice_KickOff. */
+void D3DDevice_KickPushBuffer(void)
+{
+  if (d3d_pbkit_ready) {
+    compat_d3d_push_kick();
+  }
+}
+
+/* 0x1e8a00: the GPU is busy until it has fetched up to the kicked put
+ * pointer and PGRAPH is idle. It does not kick. kb.json declares it void,
+ * but it returns a BOOL in eax. */
+int compat_D3DDevice_IsBusy(void) __asm__("_D3DDevice_IsBusy");
+int compat_D3DDevice_IsBusy(void)
+{
+  return d3d_pbkit_ready && pb_busy();
+}
+
+/* 0x1efa80 returns at once for time 0 and otherwise waits until the GPU
+ * passes the fence. The resources here carry no fence, so a nonzero time
+ * only comes from the device's own time: wait for all queued work. */
+void __stdcall D3D_BlockOnTime(uint32_t time, int param2)
+{
+  (void)param2;
+  if (time != 0) {
+    block_on_resource();
+  }
+}
+
+/* 0x1eefe0 blocks unless READONLY or NOOVERWRITE. */
 void __stdcall D3DPalette_Lock(void *palette, void **out_data, uint32_t flags)
 {
-  (void)flags;
+  if (!(flags & (D3DLOCK_READONLY | D3DLOCK_NOOVERWRITE))) {
+    block_on_resource();
+  }
   *out_data = video_address(((compat_resource *)palette)->data);
 }
 
@@ -1140,8 +1187,19 @@ void __stdcall D3DVertexBuffer_Lock(void *vertex_buffer,
                                     uint32_t size_to_lock, void **ppb_data,
                                     uint32_t flags)
 {
+  uint32_t *p;
+
   (void)size_to_lock;
-  (void)flags;
+  /* 0x1ef100: break the vertex cache unless NOFLUSH, and block unless
+   * READONLY or NOOVERWRITE. */
+  if (!(flags & D3DLOCK_NOFLUSH)) {
+    p = compat_d3d_push_begin(2);
+    p = pb_push1(p, NV097_BREAK_VERTEX_BUFFER_CACHE, 0);
+    compat_d3d_push_end(p);
+  }
+  if (!(flags & (D3DLOCK_READONLY | D3DLOCK_NOOVERWRITE))) {
+    block_on_resource();
+  }
   *ppb_data =
     (unsigned char *)video_address(((compat_resource *)vertex_buffer)->data) +
     offset_to_lock;
@@ -1182,7 +1240,10 @@ void __stdcall Lock2DSurface(void *texture, unsigned int face,
   level_info info;
   unsigned char *bits;
 
-  (void)flags;
+  /* 0x1f44f0 blocks unless NOOVERWRITE. */
+  if (!(flags & D3DLOCK_NOOVERWRITE)) {
+    block_on_resource();
+  }
   r = (const compat_resource *)texture;
   out = (d3d_locked_rect *)locked_rect;
   level_geometry(r->format, r->size, level, &info);
@@ -1220,7 +1281,10 @@ void __stdcall D3DVolumeTexture_LockBox(void *volume_texture, uint32_t level,
   level_info info;
 
   (void)box;
-  (void)flags;
+  /* Lock3DSurface (0x1f4590) blocks unless NOOVERWRITE. */
+  if (!(flags & D3DLOCK_NOOVERWRITE)) {
+    block_on_resource();
+  }
   r = (const compat_resource *)volume_texture;
   out = (d3d_locked_box *)locked_box;
   level_geometry(r->format, r->size, level, &info);
@@ -1266,6 +1330,8 @@ void __stdcall D3D_DestroyResource(void *resource)
     return;
   }
   if (r->allocation) {
+    /* 0x1ed7d0: BlockOnResource before the memory goes back. */
+    block_on_resource();
     if (r->contiguous) {
       MmFreeContiguousMemory(r->allocation);
     } else {
@@ -1307,6 +1373,7 @@ void D3DDevice_Release(void)
       gpu_clear(0, D3DCLEAR_TARGET_R | D3DCLEAR_TARGET_G |
                      D3DCLEAR_TARGET_B | D3DCLEAR_TARGET_A, 0, 0);
     }
+    compat_d3d_push_kick();
     pb_wait_until_gr_not_busy();
   }
   if (d3d_idle_framebuffer) {
@@ -1500,6 +1567,8 @@ int __stdcall D3DDevice_EndVisibilityTest(unsigned int index)
   p = pb_push1(p, NV097_GET_REPORT,
                report_offset | (NV097_GET_REPORT_TYPE_ZPASS_PIXEL_CNT << 24));
   compat_d3d_push_end(p);
+  /* 0x1e8aba: KickOff, so the report gets written while the game polls. */
+  compat_d3d_push_kick();
   return D3D_OK;
 }
 
