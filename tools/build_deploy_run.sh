@@ -120,7 +120,7 @@ log "build args: ${filtered[*]:-<none>}"
 
 log "running build"
 if ((quiet)); then
-  build_log="$(mktemp /tmp/halo-nxdk-build.XXXXXX)"
+  build_log="$(mktemp /tmp/halo-xbox-runtime-build.XXXXXX)"
   if ! "$here/build.sh" ${filtered[@]+"${filtered[@]}"} >"$build_log" 2>&1; then
     grep -E 'error|Error|ERROR|undefined' "$build_log" | head -40 || tail -40 "$build_log"
     log "build failed (full log: ${build_log}); deployment skipped"

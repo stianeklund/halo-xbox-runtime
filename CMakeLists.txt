@@ -11,7 +11,7 @@
 # Outputs build/default.xbe plus link_report.json and deps_inventory.json
 # classifying every dependency still unmet.  See docs/standalone-build.md.
 cmake_minimum_required(VERSION 3.16)
-project(halo_standalone C)
+project(halo_xbox_runtime C)
 set(CMAKE_C_STANDARD 90)
 
 # Any halo checkout or worktree works; the default is the sibling ../halo.

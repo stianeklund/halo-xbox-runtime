@@ -1,9 +1,10 @@
-# halo-nxdk
+# halo-xbox-runtime
 
-Standalone original-Xbox build of the reconstructed Halo CE source, linked
-against [nxdk](https://github.com/XboxDev/nxdk) instead of the Microsoft XDK.
+Xbox XDK compatibility layers and runtime support for Halo decompilation
+projects. The current backend targets original Xbox through
+[nxdk](https://github.com/XboxDev/nxdk).
 
-This repository contains only the nxdk-side pieces: XDK compatibility layers
+This repository contains XDK compatibility layers
 (`compat/`, one folder per library), CRT fixups (`crt/`), the runtime entry (`standalone_runtime.c`),
 and the build and debug tools (`tools/`). The game code, `kb.json` and the
 reference build tooling come from a halo checkout, which you point at with
@@ -37,7 +38,7 @@ seeded bring-up variant, the boot-test loop and the status.
 
 ## License
 
-Unless a file states otherwise, original contributions to halo-nxdk are
+Unless a file states otherwise, original contributions to halo-xbox-runtime are
 licensed under the **GNU General Public License, version 3 only**
 (`GPL-3.0-only`). See [LICENSE](LICENSE) for the full terms.
 
