@@ -112,6 +112,7 @@ static const unsigned long transform_dirty_bits[D3DTS_COUNT] = {
 #define DEVICE_VBLANK_CALLBACK 0x24ec
 #define DEVICE_FLIP_COUNT 0x2518
 #define DEVICE_SWAP_COUNT 0x2b60
+#define D3DPRESENT_INTERVAL_TWO 2
 #define D3DPRESENT_INTERVAL_IMMEDIATE 0x80000000ul
 #define THREAD_PRIORITY_TIME_CRITICAL_VALUE 15
 #define DEVICE_COMPLETED_TIME_POINTER 0x3f0
@@ -212,6 +213,7 @@ static const unsigned long d3d_device_caps[0x35] = {
 static unsigned char d3d_object;
 static void *d3d_vblank_thread;
 static unsigned long d3d_vblank_count;
+static unsigned long d3d_flip_vblank;
 static unsigned long d3d_completed_time;
 static unsigned long *d3d_render_target;
 static unsigned long *d3d_depth_stencil;
@@ -219,7 +221,8 @@ static unsigned char *d3d_idle_framebuffer;
 static void *d3d_visibility_report_pages[16];
 static int d3d_pbkit_ready;
 static int d3d_targets_dirty;
-static int d3d_present_immediate;
+/* Vertical blanks each frame stays on screen; 0 flips without waiting. */
+static unsigned long d3d_present_vblanks;
 
 /* state.c pushes only once pbkit is up. */
 int compat_d3d_pbkit_ready(void)
@@ -870,7 +873,10 @@ static unsigned long __stdcall vblank_thread(void *parameter)
   for (;;) {
     wait_for_vblank();
     d3d_vblank_count++;
-    *device_field(DEVICE_FLIP_COUNT) = *device_field(DEVICE_SWAP_COUNT);
+    if (*device_field(DEVICE_FLIP_COUNT) != *device_field(DEVICE_SWAP_COUNT)) {
+      *device_field(DEVICE_FLIP_COUNT) = *device_field(DEVICE_SWAP_COUNT);
+      d3d_flip_vblank = d3d_vblank_count;
+    }
     callback = (d3d_vblank_callback)*device_field(DEVICE_VBLANK_CALLBACK);
     if (callback) {
       data.vblank = d3d_vblank_count;
@@ -900,8 +906,17 @@ int __stdcall Direct3D_CreateDevice(uint32_t adapter, uint32_t device_type,
   pp = (const d3d_present_parameters *)present_parameters;
   width = pp->back_buffer_width ? pp->back_buffer_width : 640;
   height = pp->back_buffer_height ? pp->back_buffer_height : 480;
-  d3d_present_immediate =
-    pp->presentation_interval == D3DPRESENT_INTERVAL_IMMEDIATE;
+  switch (pp->presentation_interval) {
+  case D3DPRESENT_INTERVAL_IMMEDIATE:
+    d3d_present_vblanks = 0;
+    break;
+  case D3DPRESENT_INTERVAL_TWO:
+    d3d_present_vblanks = 2;
+    break;
+  default:
+    d3d_present_vblanks = 1;
+    break;
+  }
 
   compat_memset(D3D_DEVICE, 0, DEVICE_SIZE);
   *device_field(DEVICE_INTERRUPTS_ENABLED) = 1;
@@ -1510,7 +1525,10 @@ int __stdcall D3DDevice_GetVisibilityTestResult(unsigned int index,
  * XDK (0x1ee931) lets the CPU run two swaps ahead because its GPU waits for
  * the flip before rendering; this one renders immediately, so it returns only
  * once the vblank thread has seen the flip, unless the game asked for
- * D3DPRESENT_INTERVAL_IMMEDIATE (tearing allowed). */
+ * D3DPRESENT_INTERVAL_IMMEDIATE (tearing allowed).
+ *
+ * D3DPRESENT_INTERVAL_TWO keeps each frame up for at least two vblanks: the
+ * flip waits until one vblank has passed since the last one latched. */
 void __stdcall D3DDevice_Present(void *source_rect, void *dest_rect,
                                  void *window_override, void *dirty_region)
 {
@@ -1529,6 +1547,9 @@ void __stdcall D3DDevice_Present(void *source_rect, void *dest_rect,
     pb_wait_until_gr_not_busy();
     compat_d3d_push_rewind();
   }
+  while (d3d_vblank_count - d3d_flip_vblank + 1 < d3d_present_vblanks) {
+    wait_for_vblank();
+  }
   back = buffer_surface(DEVICE_BACK_BUFFER_SLOT);
   front = buffer_surface(DEVICE_FRONT_BUFFER_SLOT);
   bits = back[1];
@@ -1537,7 +1558,7 @@ void __stdcall D3DDevice_Present(void *source_rect, void *dest_rect,
   d3d_targets_dirty = 1;
   XVideoSetFB((unsigned char *)bits);
   (*device_field(DEVICE_SWAP_COUNT))++;
-  while (!d3d_present_immediate &&
+  while (d3d_present_vblanks &&
          *device_field(DEVICE_SWAP_COUNT) != *device_field(DEVICE_FLIP_COUNT)) {
     wait_for_vblank();
   }
