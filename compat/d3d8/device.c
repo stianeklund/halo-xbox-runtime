@@ -1555,8 +1555,8 @@ void __stdcall D3DDevice_Present(void *source_rect, void *dest_rect,
   compat_d3d_trace_mark("present");
   if (d3d_pbkit_ready) {
     /* The frame must be complete before its bits are scanned out, and pbkit
-     * only rewinds its push buffer on request. */
-    pb_wait_until_gr_not_busy();
+     * only rewinds its push buffer on request. The rewind waits for the
+     * FIFO to drain and PGRAPH to go idle. */
     compat_d3d_push_rewind();
   }
   while (d3d_vblank_count - d3d_flip_vblank + 1 < d3d_present_vblanks) {

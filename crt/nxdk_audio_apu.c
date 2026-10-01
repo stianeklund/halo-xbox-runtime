@@ -20,7 +20,8 @@ struct apu_voice {
 };
 
 static CRITICAL_SECTION audio_lock;
-static HANDLE audio_semaphore;
+/* Auto-reset: completions that land before the worker runs share one poll. */
+static KEVENT audio_event;
 static volatile int initialized;
 /* Ready, created voices, destroyed voices, queued hardware buffers,
  * completed hardware buffers, worker polls, stop timeouts, driver errors. */
@@ -40,15 +41,18 @@ static void buffer_consumed(nxAudioVoice *hardware, void *context)
     (void)hardware;
     (void)context;
     /* No allocation, FPU work, metadata mutation, or Halo callbacks here. */
-    ReleaseSemaphore(audio_semaphore, 1, NULL);
+    KeSetEvent(&audio_event, IO_NO_INCREMENT, FALSE);
 }
 
 static DWORD WINAPI apu_worker(void *context)
 {
+    /* Completions wake the worker. The timeout only backs up stop recovery:
+     * GetStatus and DirectSoundDoWork poll for themselves. */
+    LARGE_INTEGER timeout = {.QuadPart = -10 * 10000LL};
     (void)context;
     while (!initialized) Sleep(1);
     for (;;) {
-        if (WaitForSingleObject(audio_semaphore, 1) == WAIT_FAILED) Sleep(1);
+        KeWaitForSingleObject(&audio_event, Executive, KernelMode, FALSE, &timeout);
         standalone_audio_lock();
         standalone_audio_poll();
         halo_audio_apu_stats[5]++;
@@ -63,20 +67,16 @@ int standalone_audio_init(void)
     HANDLE thread;
     if (initialized) return 1;
     InitializeCriticalSection(&audio_lock);
-    audio_semaphore = CreateSemaphore(NULL, 0, 1024, NULL);
-    if (!audio_semaphore) goto failed_lock;
-    if (!nxAudioInit(&parameters)) goto failed_semaphore;
+    KeInitializeEvent(&audio_event, SynchronizationEvent, FALSE);
+    if (!nxAudioInit(&parameters)) goto failed_lock;
     thread = CreateThread(NULL, 0x10000, apu_worker, NULL, 0, NULL);
-    if (!thread) { nxAudioShutdown(); goto failed_semaphore; }
+    if (!thread) { nxAudioShutdown(); goto failed_lock; }
     SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
     CloseHandle(thread);
     halo_audio_apu_stats[0] = 1;
     initialized = 1;
     DbgPrint("[audio] nxdk-audio APU backend ready (experimental stereo)\n");
     return 1;
-failed_semaphore:
-    CloseHandle(audio_semaphore);
-    audio_semaphore = NULL;
 failed_lock:
     DeleteCriticalSection(&audio_lock);
     return failed();

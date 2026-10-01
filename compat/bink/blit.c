@@ -29,6 +29,10 @@ enum surface {
 
 static long y_table[256];
 static long cr_r[256], cr_g[256], cb_g[256], cb_b[256];
+/* Saturation by lookup: the table sums above reach -277..534 after the
+ * shift (y + cb_b at both ends). */
+#define CLIP_BIAS 384
+static unsigned char clip[1024];
 static int tables_ready;
 
 static void init_tables(void)
@@ -42,6 +46,9 @@ static void init_tables(void)
     cr_g[i] = (i - 128) * 53279;
     cb_g[i] = (i - 128) * 25675;
     cb_b[i] = (i - 128) * 132201;
+  }
+  for (i = 0; i < 1024; i++) {
+    clip[i] = i < CLIP_BIAS ? 0 : i > CLIP_BIAS + 255 ? 255 : (unsigned char)(i - CLIP_BIAS);
   }
   tables_ready = 1;
 }
@@ -58,8 +65,7 @@ void __stdcall FUN_00234110(unsigned long surface_type)
 
 static unsigned int clamp8(long v)
 {
-  v >>= FIX_SHIFT;
-  return v < 0 ? 0u : v > 255 ? 255u : (unsigned int)v;
+  return clip[(v >> FIX_SHIFT) + CLIP_BIAS];
 }
 
 static unsigned long pack(unsigned long surface, unsigned int r, unsigned int g, unsigned int b,

@@ -44,8 +44,8 @@ packet processing is queued out of the NIC interrupt.
 The target ABI uses a 12-byte XNADDR, rather than the later Xbox SDK's 36-byte
 layout. `tools/gen_xnet_profile.py` carries the supplied layout certificate's
 LAN key into the build; runtime kernel keys are not copied into the image.
-Random generation persists a rekeyed device-keyed seed on T: before returning
-bytes and fails on missing device-key or storage errors. Startup flag 1 allows
+Random generation persists a rekeyed device-keyed seed on T: once per boot,
+before returning the first bytes, and fails on missing device-key or storage errors. Startup flag 1 allows
 plain LAN IPv4 traffic; secure mappings and discovery remain encrypted.
 While XNet is started, inbound filtering fails closed: besides ARP, secure
 startup admits only the stack's DHCP replies in plaintext, and no plaintext

@@ -74,15 +74,19 @@ int halo_net_address(struct halo_xnaddr *addr) {
 }
 uint32_t halo_net_link(void) { return PhyGetLinkState(0); }
 
-/* Device-keyed HMAC generator with a persisted, rekeyed seed. T: is mounted
- * before transport initialization. Refuse generation if durable state cannot
- * be updated: timing/MAC alone is not a cryptographic seed. State is private
- * to this title and output is never used as the next on-disk seed. */
+/* Device-keyed HMAC generator with a persisted seed, rekeyed once per boot.
+ * T: is mounted before transport initialization. The first call derives this
+ * boot's key and durably saves the next seed before any output, so a crash
+ * cannot replay a key; later calls only advance a counter in memory. Refuse
+ * generation if the seed cannot be saved: timing/MAC alone is not a
+ * cryptographic seed. State is private to this title and output is never
+ * used as the next on-disk seed. */
 int halo_net_random(void *data, unsigned len) {
   static atomic_flag guard = ATOMIC_FLAG_INIT;
-  static uint8_t state[20];
+  static uint8_t state[20], key[20];
+  static ULONGLONG calls;
   static int seeded;
-  uint8_t digest[20], input[40], old[20], *out = data;
+  uint8_t digest[20], input[48], *out = data;
   LARGE_INTEGER now;
   ULONGLONG ticks;
   HANDLE file;
@@ -97,6 +101,8 @@ int halo_net_random(void *data, unsigned len) {
   KeQuerySystemTime(&now);
   ticks = KeQueryPerformanceCounter();
   memset(input, 0, sizeof(input));
+  memcpy(input + 20, &now, 8);
+  memcpy(input + 28, &ticks, 8);
   if (!seeded) {
     if (!memcmp(XboxHDKey, (const uint8_t[16]){0}, 16)) {
       result = 10091;
@@ -110,33 +116,34 @@ int halo_net_random(void *data, unsigned len) {
         memset(state, 0, sizeof(state));
       CloseHandle(file);
     }
+    memcpy(input, state, 20);
+    input[47] = 1;
+    XcHMAC(XboxHDKey, 16, input, sizeof(input), NULL, 0, key);
+    input[47] = 2;
+    XcHMAC(key, 16, input, sizeof(input), NULL, 0, state);
+    file = CreateFileA("T:\\xnet-random.bin", GENERIC_WRITE, 0, NULL,
+                       CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+      result = 10091;
+      goto done;
+    }
+    if (!WriteFile(file, state, sizeof(state), &transferred, NULL) ||
+        transferred != sizeof(state))
+      result = 10091;
+    if (NtFlushBuffersFile(file, &flush_status) < 0)
+      result = 10091;
+    if (!CloseHandle(file))
+      result = 10091;
+    if (result)
+      goto done;
+    seeded = 1;
+    memset(input, 0, 20);
   }
-  memcpy(input, state, 20);
-  memcpy(input + 20, &now, 8);
-  memcpy(input + 28, &ticks, 8);
-  input[39] = 1;
-  XcHMAC(XboxHDKey, 16, input, sizeof(input), NULL, 0, old);
-  input[39] = 2;
-  XcHMAC(old, 16, input, sizeof(input), NULL, 0, state);
-  file = CreateFileA("T:\\xnet-random.bin", GENERIC_WRITE, 0, NULL,
-                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-  if (file == INVALID_HANDLE_VALUE) {
-    result = 10091;
-    goto done;
-  }
-  if (!WriteFile(file, state, sizeof(state), &transferred, NULL) ||
-      transferred != sizeof(state))
-    result = 10091;
-  if (NtFlushBuffersFile(file, &flush_status) < 0)
-    result = 10091;
-  if (!CloseHandle(file))
-    result = 10091;
-  if (result)
-    goto done;
-  seeded = 1;
+  calls++;
+  memcpy(input + 36, &calls, 8);
   while (len) {
-    input[39] = 3;
-    XcHMAC(old, 16, input, sizeof(input), NULL, 0, digest);
+    input[47] = 3;
+    XcHMAC(key, 16, input, sizeof(input), NULL, 0, digest);
     count = len < sizeof(digest) ? len : sizeof(digest);
     memcpy(out, digest, count);
     out += count;
@@ -144,8 +151,10 @@ int halo_net_random(void *data, unsigned len) {
     memcpy(input, digest, 20);
   }
 done:
+  if (!seeded)
+    memset(key, 0, sizeof(key));
   memset(digest, 0, sizeof(digest));
-  memset(old, 0, sizeof(old));
+  memset(input, 0, sizeof(input));
   atomic_flag_clear(&guard);
   return result;
 }

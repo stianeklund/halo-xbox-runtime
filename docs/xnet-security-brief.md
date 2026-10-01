@@ -48,9 +48,13 @@ without an assigned DHCP address. Crypto runs in the TCP/IP worker, outside
 the NIC interrupt. Startup flag 1 permits plain LAN traffic while secure
 address traffic and System Link broadcasts use XNet framing.
 
-Random generation uses a device-keyed HMAC stream and a rekeyed seed persisted
-to `T:\\xnet-random.bin` before output is returned. Startup fails if the kernel
-HDD key is zero or durable seed writes fail. This assumes a private device key;
+Random generation uses a device-keyed HMAC stream. The first request of each
+boot rekeys the seed in `T:\\xnet-random.bin` and persists it before any output
+is returned; later requests advance a counter in memory. The original XNet
+works the same way (0x2260fb): it rekeys a seed sector at byte 0x1000 of
+`\Device\Harddisk0\partition0` once at startup, then generates RC4 output
+in memory (0x2262c4). Startup fails if the kernel HDD key is zero or durable
+seed writes fail. This assumes a private device key;
 an emulator's public/default EEPROM key does not supply that secrecy.
 
 ## Original implementation checklist
