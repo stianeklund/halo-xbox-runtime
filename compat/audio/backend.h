@@ -19,6 +19,11 @@ int audio_output_buffer_play(struct audio_voice *v);
 int audio_output_buffer_seek(struct audio_voice *v, unsigned int position);
 int audio_output_buffer_loop(struct audio_voice *v);
 int audio_output_mixbin_headroom(unsigned int mix_bins, unsigned int headroom);
+/* Halo's DSP effects image: retail's I3DL2 reverb and crosstalk on the GP.
+ * locations[0] is the reverb's index; the reverb then follows the listener. */
+int audio_output_effects_image(const void *image, unsigned int size, const unsigned int *locations,
+                               void **description);
+int audio_output_reverb(const int listener[12]);
 #else
 static inline int audio_output_create(struct audio_voice *v, int stream) { (void)v; (void)stream; return 1; }
 static inline void audio_output_destroy(struct audio_voice *v) { (void)v; }
@@ -35,5 +40,9 @@ static inline int audio_output_buffer_seek(struct audio_voice *v, unsigned int p
 static inline int audio_output_buffer_loop(struct audio_voice *v) { (void)v; return 1; }
 /* The software mixer has no submix stage; it behaves as headroom 0. */
 static inline int audio_output_mixbin_headroom(unsigned int mix_bins, unsigned int headroom) { (void)mix_bins; (void)headroom; return 1; }
+/* Nor DSP effects: the image is accepted and ignored. */
+static inline int audio_output_effects_image(const void *image, unsigned int size, const unsigned int *locations,
+                                             void **description) { (void)image; (void)size; (void)locations; if (description) *description = 0; return 1; }
+static inline int audio_output_reverb(const int listener[12]) { (void)listener; return 1; }
 #endif
 #endif

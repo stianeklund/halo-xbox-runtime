@@ -46,7 +46,16 @@ class ApuImage(AudioImage):
         self.import_hook("__imp_@KfLowerIrql@4", self.lower_irql)
         self.import_hook("__imp__MmAllocateContiguousMemory@4", self.contiguous)
         self.import_hook("__imp__MmFreeContiguousMemory@4", self.free_contiguous)
+        # Pages map apart unless a test opts in, so packets spanning a page
+        # take the contiguous copy path.
+        self.contiguous_pages = False
+        self.copies = 0
+        self.import_hook("__imp__MmGetPhysicalAddress@4", self.physical)
         self.import_hook("__imp__DbgPrint", lambda: self.return_from_hook())
+
+    def physical(self):
+        address, = self.args(1)
+        self.return_from_hook(address if self.contiguous_pages else address * 2 & 0xffffffff, pops=4)
 
     def import_hook(self, name, handler):
         address = self.alloc(b"\xc3")
@@ -63,7 +72,7 @@ class ApuImage(AudioImage):
 
     def create_voice(self):
         voice, format_address = self.args(2)
-        self.voices[voice] = {"destroyed": False, "queues": [], "gain": (1.0, 1.0), "pitch": 1.0,
+        self.voices[voice] = {"destroyed": False, "queues": [], "payloads": [], "gain": (1.0, 1.0), "pitch": 1.0,
                               "type": self.words(format_address + 12)[0]}
         self.write(voice, 3)  # NX_STOPPED
         self.uc.mem_write(voice + 4, bytes(self.uc.mem_read(format_address, 16)))
@@ -118,6 +127,7 @@ class ApuImage(AudioImage):
         payload, size = self.words(buffer, 2)
         assert payload and size
         self.voices[voice]["queues"].append(bytes(self.uc.mem_read(payload, size)))
+        self.voices[voice]["payloads"].append(payload)
         self.write(voice + 20 + 4 * slot, buffer)
         self.uc.mem_write(voice + 137, bytes([slot ^ 1]))
         self.return_from_hook(1)
@@ -156,6 +166,7 @@ class ApuImage(AudioImage):
 
     def contiguous(self):
         size, = self.args(1)
+        self.copies += 1
         self.return_from_hook(self.alloc(bytes(size)), pops=4)
 
     def free_contiguous(self):
@@ -189,6 +200,27 @@ def test_four_packets_and_coalesced_completion(build):
     image.service()
     assert image.callbacks == [(42, i, 0) for i in range(4)]
     assert all(image.words(packet[1])[0] == 2 and image.words(packet[2])[0] == 0 for packet in packets)
+    image.release(stream)
+
+
+def test_contiguous_packets_play_in_place(build):
+    # Halo's sound cache is physically contiguous; only packets that span
+    # pages mapped apart need a contiguous copy.
+    image = ApuImage(build)
+    stream = image.stream()
+    data = pcm(*range(3000))
+    image.submit(stream, data, 0)
+    assert image.copies == 1
+    image.contiguous_pages = True
+    payload = image.next_memory
+    image.submit(stream, data, 1)
+    assert image.copies == 1
+    hardware = image.hardware(stream)
+    assert image.voices[hardware]["queues"] == [data, data]
+    assert image.voices[hardware]["payloads"][1] == payload
+    image.complete(stream)
+    image.service()
+    assert image.callbacks == [(42, 0, 0), (42, 1, 0)]
     image.release(stream)
 
 
@@ -770,7 +802,8 @@ def test_adapter_waits_for_stream_fifo_slot(build):
 
 if __name__ == "__main__":
     build = Path(sys.argv[1] if len(sys.argv) > 1 else "build-apu")
-    for test in (test_four_packets_and_coalesced_completion, test_completion_before_next_process,
+    for test in (test_four_packets_and_coalesced_completion, test_contiguous_packets_play_in_place,
+                 test_completion_before_next_process,
                  test_reference_voice_headroom, test_pause_gain_pitch_and_adpcm, test_stop_timeout_retains_ownership,
                  test_stop_timeout_late_completion,
                  test_halo_channel_reuse, test_halo_channel_initialization, test_halo_spatial_registers,

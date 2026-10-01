@@ -22,7 +22,9 @@ if(HALO_STANDALONE_AUDIO)
 				--xbe "${HALO_STANDALONE_LAYOUT_XBE}" --out "${gen_dir}/xdk_hrtf.h"
 			DEPENDS "${CMAKE_SOURCE_DIR}/tools/gen_xdk_hrtf.py" "${HALO_STANDALONE_LAYOUT_XBE}"
 			VERBATIM)
-		target_sources(standalone_crt PRIVATE nxdk_audio_apu.c "${gen_dir}/xdk_hrtf.h")
+		target_sources(standalone_crt PRIVATE nxdk_audio_apu.c xdk_i3dl2.c "${gen_dir}/xdk_hrtf.h")
+		# Retail's I3DL2 math keeps x87 intermediates at 64-bit precision.
+		set_property(SOURCE xdk_i3dl2.c APPEND PROPERTY COMPILE_OPTIONS -mlong-double-80)
 		target_compile_definitions(standalone_crt PRIVATE HALO_AUDIO_APU=1)
 	else()
 		target_sources(standalone_crt PRIVATE nxdk_audio.c)
@@ -52,7 +54,7 @@ set_target_properties(standalone_crt PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
 # compiled as they come.
 set(CRT_OWN_SOURCES msvc_print.c nxdk_net.c nxdk_debug_net.c nxdk_xnet.c
 	../compat/xnet/xnet.c ../compat/xnet/security.c nxdk_keyboard.c nxdk_usb.c
-	../compat/audio/mixer.c nxdk_audio_apu.c nxdk_audio.c)
+	../compat/audio/mixer.c nxdk_audio_apu.c xdk_i3dl2.c nxdk_audio.c)
 set_property(SOURCE ${CRT_OWN_SOURCES} APPEND PROPERTY COMPILE_OPTIONS -Wall -Werror)
 target_include_directories(standalone_crt BEFORE PRIVATE
 	"${NXDK_DIR}/lib/pdclib"

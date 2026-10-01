@@ -8,6 +8,7 @@
 #include "audio_internal.h"
 #include "../compat/audio/backend.h"
 #include "xdk_hrtf.h"
+#include "xdk_i3dl2.h"
 
 struct apu_voice {
     nxAudioVoice hardware;
@@ -35,13 +36,17 @@ static volatile int initialized;
 /* Ready, created voices, destroyed voices, queued hardware buffers,
  * completed hardware buffers, worker polls, stop timeouts, driver errors. */
 volatile unsigned int halo_audio_apu_stats[8];
+/* The last driver error's caller and nxdk-audio result, for XBDM. */
+volatile unsigned int halo_audio_apu_last_failure[2];
 
 void standalone_audio_lock(void) { EnterCriticalSection(&audio_lock); }
 void standalone_audio_unlock(void) { LeaveCriticalSection(&audio_lock); }
 
-static int failed(void)
+static __attribute__((noinline)) int failed(void)
 {
     halo_audio_apu_stats[7]++;
+    halo_audio_apu_last_failure[0] = (unsigned int)__builtin_return_address(0);
+    halo_audio_apu_last_failure[1] = nxAudioGetLastError();
     return 0;
 }
 
@@ -445,25 +450,41 @@ static void pump(struct apu_voice *h)
         if (!nxAudioVoiceStart(&h->hardware)) failed();
 }
 
+static int physically_contiguous(const unsigned char *data, unsigned int size)
+{
+    ULONG_PTR start = MmGetPhysicalAddress((PVOID)data);
+    unsigned int offset = PAGE_SIZE - ((ULONG_PTR)data & (PAGE_SIZE - 1));
+    for (; offset < size; offset += PAGE_SIZE)
+        if (MmGetPhysicalAddress((PVOID)(data + offset)) != start + offset) return 0;
+    return 1;
+}
+
 int audio_output_submit(struct audio_voice *v, const struct audio_packet *p)
 {
     struct apu_voice *h = v->backend;
     unsigned int slot = v->write_packet;
+    const void *data = p->data;
     void *copy;
     if (h->stopping && h->valid) return 0;
     if (!audio_voice_ready(v) || !audio_data_valid(&v->format, p->data, p->size)) return 0;
     if (!h->valid && !make_voice(h)) return 0;
-    if (h->capacity[slot] < p->size) {
-        copy = MmAllocateContiguousMemory(p->size);
-        if (!copy) return failed();
-        if (h->copies[slot]) MmFreeContiguousMemory(h->copies[slot]);
-        h->copies[slot] = copy;
-        h->capacity[slot] = p->size;
+    /* SSL ADPCM blocks cannot straddle discontiguous physical pages. Halo's
+     * sound cache is one physical allocation, so its packets play in place,
+     * as retail's do; anything else gets a contiguous copy per packet slot,
+     * reused after its game callback. Copying every packet left too little
+     * contiguous memory once the effects image took its scratch. */
+    if (!physically_contiguous(p->data, p->size)) {
+        if (h->capacity[slot] < p->size) {
+            copy = MmAllocateContiguousMemory(p->size);
+            if (!copy) return failed();
+            if (h->copies[slot]) MmFreeContiguousMemory(h->copies[slot]);
+            h->copies[slot] = copy;
+            h->capacity[slot] = p->size;
+        }
+        memcpy(h->copies[slot], p->data, p->size);
+        data = h->copies[slot];
     }
-    /* SSL ADPCM blocks cannot straddle discontiguous physical pages. Keep
-     * a contiguous copy per packet slot, reused after its game callback. */
-    memcpy(h->copies[slot], p->data, p->size);
-    if (!nxAudioBufferInitialize(&h->buffers[slot], h->copies[slot], p->size)) return failed();
+    if (!nxAudioBufferInitialize(&h->buffers[slot], data, p->size)) return failed();
     if (!audio_voice_submit(v, p)) return 0;
     pump(h);
     return 1;
@@ -513,6 +534,190 @@ int audio_output_mixbin_headroom(unsigned int mix_bins, unsigned int headroom)
                       headroom & NV1BA0_PIO_SET_SUBMIX_HEADROOM_AMOUNT);
     }
     KfLowerIrql(irql);
+    return 1;
+}
+
+/* DownloadEffectsImage (cachebeta 0x203a21, FUN_00207be4/FUN_00207963). The
+ * image's first 0x800 bytes are retail's GP loader, which the patched
+ * nxdk-audio GP program replaces. It keeps the loader's scratch layout: the
+ * command block at 0x800, effect code from 0x818, then the effect state,
+ * then the effect table. Effect scratch starts at 0xc000. */
+#define EFFECTS_SCRATCH 0xc000u
+#define EFFECTS_STATE_X 0x80u
+#define EFFECTS_MAX 16u
+#define GP_XMEM (APU_MMIO_BASE + APU_GP_OFFSET)
+#define GP_YMEM (APU_MMIO_BASE + APU_GP_OFFSET + 0x6000u)
+
+/* DSEFFECTMAP and DSEFFECTIMAGEDESC, as retail relocates them: code and
+ * scratch as host pointers into scratch memory, state and Y memory as GP
+ * MMIO addresses. */
+struct effect_map {
+    void *code;
+    uint32_t code_size;
+    void *state;
+    uint32_t state_size;
+    void *ymem;
+    uint32_t ymem_size;
+    void *scratch;
+    uint32_t scratch_size;
+};
+static struct {
+    uint32_t count, scratch_size;
+    struct effect_map map[EFFECTS_MAX];
+} effects;
+static unsigned char *effects_scratch;
+/* The I3DL2 reverb's state in scratch (a byte offset) and in GP X memory;
+ * zero without one. state_address is the scratch offset loaded to X:$80. */
+static uint32_t reverb_state, reverb_x, state_address;
+
+/* The XDK's image cipher (0x20de7e, 0x20dfc2, 0x20e097): a 64-bit LFSR
+ * keystream, a fixed key, and an 8-byte IV per block. */
+struct lfsr {
+    uint32_t lo, hi;
+};
+
+static void lfsr_step(struct lfsr *s)
+{
+    uint32_t lo = s->lo;
+    s->lo = lo >> 1 | s->hi << 31;
+    s->hi = (((((((lo << 2) ^ lo) << 1) ^ lo) << 28) ^ s->hi) & 0x80000000u) | s->hi >> 1;
+}
+
+static struct lfsr lfsr_key(void)
+{
+    struct lfsr s = {0x49de12ba, 0x7fa49bca};
+    unsigned int i;
+    for (i = 0; i < 81; i++) lfsr_step(&s);
+    return s;
+}
+
+static void unscramble(const unsigned char iv[8], unsigned char *data, uint32_t size)
+{
+    struct lfsr s = lfsr_key();
+    unsigned char key[8];
+    uint32_t i;
+    memcpy(key, &s.lo, 4);
+    memcpy(key + 4, &s.hi, 4);
+    lfsr_step(&s);
+    for (i = 0; i < size; i++) {
+        lfsr_step(&s);
+        data[i] = (unsigned char)(key[i & 7] ^ s.lo ^ (data[i] - iv[i & 7] * key[i & 7]));
+    }
+}
+
+/* The GP clears the flags once it has loaded what a command asked for. It
+ * reads the block at the start of every 32-sample frame. */
+static int gp_idle(nxAudioGPCommand *command)
+{
+    unsigned int attempts;
+    for (attempts = 0; attempts < 100; attempts++) {
+        if (!command->flags) return 1;
+        Sleep(1);
+    }
+    DbgPrint("[audio] GP command timed out\n");
+    return 0;
+}
+
+int audio_output_effects_image(const void *image, unsigned int size, const unsigned int *locations,
+                               void **description)
+{
+    const unsigned char *in = image;
+    unsigned char *scratch, *keys, key[8];
+    nxAudioGPCommand *command;
+    struct lfsr s;
+    uint32_t header[6], table, count, total, raw[8], i;
+    if (!initialized || size < NX_AUDIO_GP_SCRATCH_CODE + 8 || size > EFFECTS_SCRATCH) return 0;
+    memcpy(header, in + NX_AUDIO_GP_SCRATCH_COMMAND, sizeof(header));
+    /* Retail's relocations assume the state follows the code, from X:$80. */
+    if (header[0] || header[1] >= size || header[3] >= size ||
+        header[2] != NX_AUDIO_GP_SCRATCH_CODE + header[1] * 4)
+        return 0;
+    table = header[2] + header[3] * 4;
+    if (table + 8 > size) return 0;
+    memcpy(&count, in + table, 4);
+    memcpy(&total, in + table + 4, 4);
+    if (!count || count > EFFECTS_MAX || table + 8 + count * 40 > size || total > 0x200000) return 0;
+    for (i = 0; i < count; i++) {
+        memcpy(raw, in + table + 8 + i * 32, sizeof(raw));
+        if (raw[0] < NX_AUDIO_GP_SCRATCH_CODE || raw[0] > header[2] || raw[1] > header[2] - raw[0] ||
+            raw[2] & 3 || raw[2] < header[2] || raw[2] > table || raw[3] > table - raw[2] ||
+            raw[6] > EFFECTS_SCRATCH + total || raw[7] > EFFECTS_SCRATCH + total - raw[6])
+            return 0;
+    }
+
+    if (!(scratch = nxAudioGPScratch(EFFECTS_SCRATCH + total))) return failed();
+    command = (nxAudioGPCommand *)(scratch + NX_AUDIO_GP_SCRATCH_COMMAND);
+    if (!gp_idle(command)) return failed();
+    memcpy(scratch + NX_AUDIO_GP_SCRATCH_CODE, in + NX_AUDIO_GP_SCRATCH_CODE, size - NX_AUDIO_GP_SCRATCH_CODE);
+    /* The per-effect IVs are themselves scrambled, with the key as the IV. */
+    keys = scratch + table + 8 + count * 32;
+    s = lfsr_key();
+    memcpy(key, &s.lo, 4);
+    memcpy(key + 4, &s.hi, 4);
+    unscramble(key, keys, count * 8);
+    effects.count = count;
+    effects.scratch_size = total;
+    for (i = 0; i < count; i++) {
+        struct effect_map *m = &effects.map[i];
+        memcpy(raw, in + table + 8 + i * 32, sizeof(raw));
+        unscramble(keys + i * 8, scratch + raw[0], raw[1]);
+        m->code = scratch + raw[0];
+        m->code_size = raw[1];
+        m->state = (void *)(GP_XMEM + (EFFECTS_STATE_X + (raw[2] - header[2]) / 4) * 4);
+        m->state_size = raw[3];
+        m->ymem = (void *)(GP_YMEM + raw[4]);
+        m->ymem_size = raw[5];
+        m->scratch = scratch + raw[6];
+        m->scratch_size = raw[7];
+    }
+    effects_scratch = scratch;
+    state_address = header[2];
+    reverb_state = reverb_x = 0;
+    if (locations && locations[0] < count) {
+        memcpy(raw, in + table + 8 + locations[0] * 32, sizeof(raw));
+        reverb_state = raw[2];
+        reverb_x = EFFECTS_STATE_X + (raw[2] - header[2]) / 4;
+    }
+    if (description) *description = &effects;
+
+    command->state_offset = header[0];
+    command->code_words = header[1];
+    command->state_address = header[2];
+    command->state_words = header[3];
+    command->reserved = header[5];
+    __asm__ volatile("" ::: "memory");
+    command->flags = NX_AUDIO_GP_LOAD_CODE | NX_AUDIO_GP_LOAD_STATE;
+    if (!gp_idle(command)) return failed();
+    DbgPrint("[audio] GP loaded %u effects, %u bytes of scratch\n", count, total);
+    return 1;
+}
+
+/* CMcpxAPU_Commit3dSettings (0x206a5e) with a new I3DL2 listener: read the
+ * reverb's live parameters, rebuild them, flag the change (bit 2 of the word
+ * at 0x10) and reload words 0x10-0x21f from scratch. The scratch copy's words
+ * 0x14-0x117 still hold the image's values, which the reload restores. */
+int audio_output_reverb(const int listener[12])
+{
+    unsigned char state[0x220];
+    nxAudioGPCommand *command;
+    uint32_t i, word;
+    if (!initialized || !reverb_state) return 1;
+    command = (nxAudioGPCommand *)(effects_scratch + NX_AUDIO_GP_SCRATCH_COMMAND);
+    if (!gp_idle(command)) return failed();
+    for (i = 0; i < 0x118 / 4; i++) {
+        word = apu_read_reg(APU_GP_OFFSET + (reverb_x + i) * 4);
+        memcpy(state + i * 4, &word, 4);
+    }
+    xdk_i3dl2_reverb_parameters((const int32_t *)listener, state);
+    memcpy(&word, state + 0x10, 4);
+    word |= 4;
+    memcpy(effects_scratch + reverb_state + 0x10, &word, 4);
+    memcpy(effects_scratch + reverb_state + 0x118, state + 0x118, 0x108);
+    command->state_offset = (reverb_state + 0x10 - state_address) / 4;
+    command->state_address = reverb_state + 0x10;
+    command->state_words = (0x220 - 0x10) / 4;
+    __asm__ volatile("" ::: "memory");
+    command->flags = NX_AUDIO_GP_LOAD_STATE;
     return 1;
 }
 

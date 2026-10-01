@@ -2,8 +2,9 @@
  * PCM and Xbox IMA ADPCM, software volume/pitch, streams and static buffers.
  * Packet callbacks run only from DirectSoundDoWork on the game thread.
  * 3D sources follow retail DirectSound's model; the APU backend plays mono
- * ones on hardware 3D voices with the XDK HRTF. Reverb, DSP effects and
- * surround mix bins remain unsupported. */
+ * ones on hardware 3D voices with the XDK HRTF, and runs Halo's DSP effects
+ * image (I3DL2 reverb, crosstalk) on the GP. Surround output remains
+ * unsupported. */
 #include "xbox.h"
 #include "mixer.h"
 #include "backend.h"
@@ -456,11 +457,13 @@ int __stdcall nxds_speakers(void *ds, unsigned int *config)
 }
 
 /* Listener state, already in DirectSound's Y-up axes (Halo swaps Y/Z). Of
- * the I3DL2 listener, only the room rolloff and HF reference reach voices. */
+ * the I3DL2 listener, the room rolloff and HF reference reach voices; all of
+ * it reaches the reverb when the listener is next committed. */
 static float listener_position[3], listener_velocity[3];
 static float listener_front[3] = {0, 0, 1}, listener_top[3] = {0, 1, 0};
 static float listener_rolloff = 1.0f, listener_distance = 1.0f, listener_doppler = 1.0f;
 static float listener_room_rolloff, listener_hf_reference = 5000.0f;
+static int listener_i3dl2[12], listener_i3dl2_pending;
 
 /* x87 instructions keep pdclib's math closure out, as unit_power does. */
 static double root(double x)
@@ -762,7 +765,12 @@ int __stdcall IDirectSoundStream_SetConeOutsideVolume(void *stream, int volume, 
 
 static int listener_changed(uint32_t apply)
 {
-  int result = apply ? 1 : apply_all();
+  int result = 1;
+  if (!apply && listener_i3dl2_pending) {
+    result = audio_output_reverb(listener_i3dl2);
+    listener_i3dl2_pending = 0;
+  }
+  if (!apply && !apply_all()) result = 0;
   standalone_audio_unlock();
   return result ? DS_OK : DS_FAILED;
 }
@@ -827,16 +835,33 @@ int __stdcall nxds_doppler(void *ds, float factor, unsigned int apply)
   return listener_changed(apply);
 }
 
-/* DSI3DL2LISTENER. Its reverb parameters belong to Halo's DSP image. */
+/* DSI3DL2LISTENER: twelve words, LONG levels and FLOAT parameters. */
 int __stdcall IDirectSound_SetI3DL2Listener(void *ds, const void *params, unsigned int apply)
 {
   const float *values = params;
+  unsigned int i;
   (void)ds;
   if (!params) return DS_INVALID;
   standalone_audio_lock();
   listener_room_rolloff = values[2];
   listener_hf_reference = values[11];
+  for (i = 0; i < 12; i++) listener_i3dl2[i] = ((const int *)params)[i];
+  listener_i3dl2_pending = 1;
   return listener_changed(apply);
+}
+
+/* Halo downloads its image once at startup, with the reverb as effect 0 and
+ * crosstalk as effect 1 (DSEFFECTIMAGELOC). */
+int __stdcall IDirectSound_DownloadEffectsImage(void *ds, const void *image, uint32_t size, void *locations,
+                                                void **description)
+{
+  int ok;
+  (void)ds;
+  if (!image) return DS_INVALID;
+  standalone_audio_lock();
+  ok = audio_output_effects_image(image, size, locations, description);
+  standalone_audio_unlock();
+  return ok ? DS_OK : DS_FAILED;
 }
 
 /* Halo clears the headroom of every bin but the last at startup. */

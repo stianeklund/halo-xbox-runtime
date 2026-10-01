@@ -1,6 +1,16 @@
 --- a/audio_core.c
 +++ b/audio_core.c
-@@ -41,7 +41,7 @@
+@@ -17,6 +17,9 @@
+ static volatile mcpx_sge_t *g_hw_gp_fifos = NULL;
+ static void *g_hw_ac97_buffer = NULL;
+ static void *g_hw_gp_pmem = NULL;
++// GP scratch memory: g_hw_gp_pmem until nxAudioGPScratch maps more
++static void *g_hw_gp_scratch = NULL;
++static uint32_t g_hw_gp_scratch_size = 0;
+ static void *g_hw_hrtf_targets = NULL;
+ static void *g_hw_hrtf_currents = NULL;
+ nxAudioVoice *g_tracked_voices[MCPX_HW_MAX_VOICES];
+@@ -41,7 +44,7 @@
  #ifndef __INTELLISENSE__
  #ifndef __clang_analyzer__
  static const char passthrough_text[] = {
@@ -9,7 +19,21 @@
      , '\0'};
  #endif
  #endif
-@@ -293,8 +293,15 @@
+@@ -96,9 +99,11 @@
+ 
+                 // Parse the 4-digit address and 6-digit opcode as hex (%x)
+                 if (sscanf(line, "P %x %x", &address, &opcode) == 2) {
+-                    if (count < max_out) {
++                    // The program may have gaps (org), so place each word at its address
++                    if (address < max_out) {
+                         // The %x naturally parses '44F400' into 0x0044F400 (32-bit padded)
+-                        output_buffer[count++] = opcode;
++                        output_buffer[address] = opcode;
++                        count++;
+                     }
+                 }
+             }
+@@ -293,8 +298,15 @@
                      if (!buffer) {
                          continue;
                      }
@@ -26,7 +50,72 @@
                          voice->buffers_hardware[j] = NULL;
                          if (voice->callback) {
                              voice->callback(voice, voice->user_context);
-@@ -693,7 +700,7 @@
+@@ -325,6 +337,43 @@
+     return g_last_error;
+ }
+ 
++void *nxAudioGPScratch (uint32_t size)
++{
++    const uint32_t max_size = MCPX_HW_GP_SGE_ARRAY_SIZE / sizeof(mcpx_sge_t) * PAGE_SIZE;
++    size = (size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
++    if (!g_hw_gp_scratch || size > max_size) {
++        apu_set_last_error(!g_hw_gp_scratch ? NX_AUDIO_ERR_INVALID_STATE : NX_AUDIO_ERR_INVALID_PARAM);
++        return NULL;
++    }
++    if (size <= g_hw_gp_scratch_size) {
++        return g_hw_gp_scratch;
++    }
++
++    void *scratch = MmAllocateContiguousMemoryEx(size, 0, 0xFFFFFFFF, PAGE_SIZE, PAGE_READWRITE);
++    if (!scratch) {
++        apu_set_last_error(NX_AUDIO_ERR_OUT_OF_MEMORY);
++        return NULL;
++    }
++    memset(scratch, 0, size);
++    memcpy(scratch, g_hw_gp_scratch, g_hw_gp_scratch_size);
++
++    // The GP DMAs through these entries as it runs. Each page holds the same words in either mapping, so a
++    // transfer that sees some of each is still correct.
++    for (uint32_t i = 0; i < size / PAGE_SIZE; i++) {
++        g_hw_gp_sges[i].phys_addr = MmGetPhysicalAddress(scratch) + i * PAGE_SIZE;
++        g_hw_gp_sges[i].length_and_format = PAGE_SIZE;
++    }
++
++    // Let any transfer through the old pages finish before they go. A GP frame is 32 samples, under 1 ms.
++    if (g_hw_gp_scratch != g_hw_gp_pmem) {
++        KeStallExecutionProcessor(2000);
++        MmFreeContiguousMemory(g_hw_gp_scratch);
++    }
++    g_hw_gp_scratch = scratch;
++    g_hw_gp_scratch_size = size;
++    return scratch;
++}
++
+ bool nxAudioInit (const nxAudioInitParams *parameters)
+ {
+     (void)parameters;
+@@ -566,6 +615,8 @@
+         g_hw_gp_sges[0].length_and_format = PAGE_SIZE;
+         g_hw_gp_sges[1].phys_addr = MmGetPhysicalAddress(g_hw_gp_pmem) + PAGE_SIZE;
+         g_hw_gp_sges[1].length_and_format = PAGE_SIZE;
++        g_hw_gp_scratch = g_hw_gp_pmem;
++        g_hw_gp_scratch_size = MAX_DSP_PAYLOAD;
+     }
+ 
+     // Enable GP which automatically reads in the DSP code (Now setup in NV_PAPU_GPSADDR)
+@@ -627,6 +678,11 @@
+     APU_FREE(g_hw_gp_sges);
+     APU_FREE(g_hw_vp_sges);
+     APU_FREE(g_hw_gp_fifos);
++    if (g_hw_gp_scratch != g_hw_gp_pmem) {
++        APU_FREE(g_hw_gp_scratch);
++    }
++    g_hw_gp_scratch = NULL;
++    g_hw_gp_scratch_size = 0;
+     APU_FREE(g_hw_gp_pmem);
+     APU_FREE(g_hw_hrtf_targets);
+     APU_FREE(g_hw_hrtf_currents);
+@@ -693,7 +749,7 @@
      }
  
      // Snap azimuth to nearest 5-degree grid point
@@ -390,33 +479,247 @@
      uint32_t cfg_vbin;
      uint32_t cfg_fmt;
      uint32_t cfg_env0;
+@@ -409,6 +410,41 @@
+ bool nxAudioHRTFSetParamsFromAngles (uint8_t index, float azimuth, float elevation);
+ 
+ /**
++ * @brief Command block the GP program reads from scratch memory every frame.
++ *
++ * The GP program runs effect code from P:$171 after the VP fills the mix bins, with the effects' state from X:$80.
++ * Until code is loaded there, it mixes HRTF bins 6 and 8 into bin 0, and 7 and 9 into bin 1. To load effects,
++ * write the code to scratch offset NX_AUDIO_GP_SCRATCH_CODE and the state anywhere in scratch, fill in the block at
++ * NX_AUDIO_GP_SCRATCH_COMMAND, then set its flags. The GP clears the flags once it has loaded the words; wait for
++ * that before changing the block again. This is the layout retail DirectSound's effects images are built for.
++ */
++typedef struct
++{
++    uint32_t state_offset;   // First X word to load, counted from X:$80
++    uint32_t code_words;     // Words of code at NX_AUDIO_GP_SCRATCH_CODE
++    uint32_t state_address;  // Scratch byte offset of the state words
++    uint32_t state_words;    // State words to load
++    volatile uint32_t flags; // NX_AUDIO_GP_LOAD_CODE and/or NX_AUDIO_GP_LOAD_STATE
++    uint32_t reserved;
++} nxAudioGPCommand;
++
++#define NX_AUDIO_GP_SCRATCH_COMMAND 0x800
++#define NX_AUDIO_GP_SCRATCH_CODE    0x818
++#define NX_AUDIO_GP_LOAD_CODE       0x1 // Also clears X:$80-$FFF and Y memory first
++#define NX_AUDIO_GP_LOAD_STATE      0x2
++
++/**
++ * @brief Maps at least size bytes of GP scratch memory and returns it.
++ *
++ * Effects reach scratch memory through DSP DMA. The first 0x2000 bytes hold the GP program, which the GP loads at
++ * reset, and the command block. Growing the mapping keeps the contents. Grow it before loading effects that use it.
++ *
++ * @param size Bytes the GP needs to reach.
++ * @return The scratch memory, or NULL if it could not be mapped.
++ */
++void *nxAudioGPScratch (uint32_t size);
++
++/**
+  * @brief Retrieves the last error code generated by the audio subsystem.
+  * @return The last nxAudioResult error code.
+  */
 --- a/passthrough.a56
 +++ b/passthrough.a56
-@@ -104,7 +104,10 @@
+@@ -23,6 +23,13 @@
+ DMA_MAP_YMEM             equ $1800
+ DMA_MAP_PMEM             equ $2800
+ 
++; A command block linked to itself with the end of list bit set
++DMA_NODE_EOL             equ $4000
++; 24-bit words between DSP memory and scratch memory (buffer $F), one DSP
++; word per step. Bit 1 is the direction: set writes to scratch.
++DMA_SCRATCH_READ         equ $0059E0
++DMA_SCRATCH_WRITE        equ $0059E2
++
+ MIXBIN_BASE_ADDR         equ $1400
+ MIXBIN_FRONT_LEFT        equ (MIXBIN_BASE_ADDR + $00)  ; 0 * $20
+ MIXBIN_FRONT_RIGHT       equ (MIXBIN_BASE_ADDR + $20)  ; 1 * $20
+@@ -36,9 +43,23 @@
+ MIXBIN_HRTF_8            equ (MIXBIN_BASE_ADDR + $100) ; 8 * $20 (BACK LEFT)
+ MIXBIN_HRTF_9            equ (MIXBIN_BASE_ADDR + $120) ; 9 * $20 (BACK RIGHT)
+ 
+-; Variables
+-org x:$0100
++; Effects. The host loads effect code to P:EFFECTS_CODE and its state to
++; X:EFFECTS_STATE through the command block in scratch memory (see
++; nxAudioGPCommand in nxaudio.h), the layout retail DirectSound's effects
++; images are built for. Each frame runs the code at EFFECTS_CODE once the VP
++; has filled the mix bins, before bins 0 and 1 go out to the AC97.
++SCRATCH_COMMAND          equ $000800
++SCRATCH_CODE             equ $000818
++EFFECTS_CODE             equ $000171
++EFFECTS_STATE            equ $000080
++COMMAND_LOAD_CODE        equ $00
++COMMAND_LOAD_STATE       equ $01
++
++; Variables. Everything from X:EFFECTS_STATE up belongs to the effects.
++org x:$0000
++command                  ds 6 ; state offset, code words, state address, state words, flags, reserved
+ dma_node0                ds 7
++scratch_node             ds 7
+ 
+ ; Program memory. Reset vector is at $000000
+ org p:$000000
+@@ -46,15 +67,26 @@
+     ; Flush all pending interrupt bits
+     movep #$000FFF, x:DSP_IRQ_STATUS
+ 
++    ; Effects expect zeroed memory, and DMA reads all 7 words of a block
++    clr a
++    move #0, r0
++    move #>$1000, x0
++    rep x0
++    move a, x:(r0)+
++    move #0, r0
++    move #>$0800, x0
++    rep x0
++    move a, y:(r0)+
++
+     ; First thing we do is set up the DMA control block. This is 7 words,
+     ; and we set up where to read the audio data from and where to output it.
+     ; Our setup will read data from MIXBIN 0 and MIXBIN 1 (Front left and front right)
+     ; and output it to GP OUT FIFO 0 (Set up in nxdk audio driver) for consumption by AC97.
+     ; Ref https://xboxdevwiki.net/DSP#Command_blocks
+-    
++
+     ; word0 = next block linkage
+     ; We link back to itself, but also set the end of list bit ($4000)
+-    move #>(dma_node0+$4000), x0
++    move #>(dma_node0+DMA_NODE_EOL), x0
+     move x0, x:dma_node0+0
+ 
+     ; word1 = control word
+@@ -82,11 +114,7 @@
+     move #MIXBIN_BASE_ADDR, x0
+     move x0, x:dma_node0+3
+ 
+-    ; word4, 5, 6 (Unused - Clear them out)
+-    move #>$000000, x0     
+-    move x0, x:dma_node0+4
+-    move x0, x:dma_node0+5
+-    move x0, x:dma_node0+6
++    ; word4, 5, 6 stay clear
+ 
+     ; Stop our DMA from starting
+     movep #DMA_CONTROL_STOP, x:DMA_CONTROL
+@@ -104,7 +132,96 @@
          jclr #DSP_IRQ_START_FRAME_BIT, x:DSP_IRQ_STATUS, _wait_for_frame
          movep #DSP_IRQ_START_FRAME_MASK, x:DSP_IRQ_STATUS
  
 -    ; Mix HRTF bins (6, 8 -> 0) and (7, 9 -> 1)
-+    ; Mix HRTF bins (6, 8 -> 0) and (7, 9 -> 1) at +6 dB. Halo's DSP image,
-+    ; which this program stands in for, plays them louder than a plain sum:
-+    ; xemu recordings put cachebeta's 3D voices 6 dB below their front level,
-+    ; but xemu's normalized HRTF stage alone removes about 12 dB.
++    ; Fetch the command block. The host fills it, then sets its flags.
++    move #>command, a
++    move #>SCRATCH_COMMAND, b
++    move #>6, y0
++    move #>DMA_SCRATCH_READ, x0
++    jsr _scratch_dma
++    move x:command+4, a
++    tst a
++    jeq _run_effects
++
++    ; New code: clear the effects' X and Y memory, then fetch the code
++    jclr #COMMAND_LOAD_CODE, x:command+4, _load_state
++    movec #$FFFFFF, m0
++    movec m0, m1
++    movec m0, m2
++    movec m0, m3
++    movec m0, m4
++    movec m0, m5
++    clr a
++    move #EFFECTS_STATE, r0
++    move #>($1000-EFFECTS_STATE), x0
++    rep x0
++    move a, x:(r0)+
++    move #0, r0
++    move #>$0800, x0
++    rep x0
++    move a, y:(r0)+
++    move #>(DMA_MAP_PMEM+EFFECTS_CODE), a
++    move #>SCRATCH_CODE, b
++    move x:command+1, y0
++    move #>DMA_SCRATCH_READ, x0
++    jsr _scratch_dma
++
++_load_state
++    jclr #COMMAND_LOAD_STATE, x:command+4, _command_done
++    move #>(DMA_MAP_XMEM+EFFECTS_STATE), a
++    move x:command+0, x0
++    add x0, a
++    move x:command+2, b
++    move x:command+3, y0
++    move #>DMA_SCRATCH_READ, x0
++    jsr _scratch_dma
++
++    ; Clear the flags in scratch; the host waits for that before its next command
++_command_done
++    clr a
++    move a, x:command+4
++    move #>command, a
++    move #>SCRATCH_COMMAND, b
++    move #>6, y0
++    move #>DMA_SCRATCH_WRITE, x0
++    jsr _scratch_dma
++
++_run_effects
++    jsr EFFECTS_CODE
++
++    ; Pre-clear any pending DMA EOL interrupt before triggering (avoids false positive in wait loop)
++    movep #DSP_IRQ_DMA_EOL_MASK, x:DSP_IRQ_STATUS
++
++    ; Update NEXT_BLOCK to point to our DMA node and issue START
++    movep #dma_node0, x:DMA_NEXT_BLOCK
++    movep #DMA_CONTROL_START, x:DMA_CONTROL
++
++    ; Wait for DMA completion
++    _wait_dma_eol
++        jclr #DSP_IRQ_DMA_EOL_BIT, x:DSP_IRQ_STATUS, _wait_dma_eol
++        movep #DSP_IRQ_DMA_EOL_MASK, x:DSP_IRQ_STATUS
++
++    jmp _audio_loop
++
++; Copy y0 words between DSP address a and scratch byte address b, in the
++; direction x0 gives
++_scratch_dma
++    move #>(scratch_node+DMA_NODE_EOL), x1
++    move x1, x:scratch_node+0
++    move x0, x:scratch_node+1
++    move y0, x:scratch_node+2
++    move a, x:scratch_node+3
++    move b, x:scratch_node+4
++    movep #DSP_IRQ_DMA_EOL_MASK, x:DSP_IRQ_STATUS
++    movep #scratch_node, x:DMA_NEXT_BLOCK
++    movep #DMA_CONTROL_START, x:DMA_CONTROL
++    _wait_scratch_eol
++        jclr #DSP_IRQ_DMA_EOL_BIT, x:DSP_IRQ_STATUS, _wait_scratch_eol
++        movep #DSP_IRQ_DMA_EOL_MASK, x:DSP_IRQ_STATUS
++    rts
++
++; Without loaded effects, mix HRTF bins (6, 8 -> 0) and (7, 9 -> 1)
++org p:EFFECTS_CODE
++_effects
      move #MIXBIN_FRONT_LEFT, r0
      move #MIXBIN_HRTF_6, r1
      move #MIXBIN_HRTF_8, r2
-@@ -112,6 +115,7 @@
-         move x:(r1)+, a
-         move x:(r2)+, b
-         add b, a
-+        asl a
-         move x:(r0), b
+@@ -128,17 +245,4 @@
          add b, a
          move a, x:(r0)+
-@@ -124,6 +128,7 @@
-         move x:(r1)+, a
-         move x:(r2)+, b
-         add b, a
-+        asl a
-         move x:(r0), b
-         add b, a
-         move a, x:(r0)+
+         _mix_right
+-
+-    ; Pre-clear any pending DMA EOL interrupt before triggering (avoids false positive in wait loop)
+-    movep #DSP_IRQ_DMA_EOL_MASK, x:DSP_IRQ_STATUS
+-
+-    ; Update NEXT_BLOCK to point to our DMA node and issue START
+-    movep #dma_node0, x:DMA_NEXT_BLOCK
+-    movep #DMA_CONTROL_START, x:DMA_CONTROL
+-
+-    ; Wait for DMA completion
+-    _wait_dma_eol
+-        jclr #DSP_IRQ_DMA_EOL_BIT, x:DSP_IRQ_STATUS, _wait_dma_eol
+-        movep #DSP_IRQ_DMA_EOL_MASK, x:DSP_IRQ_STATUS
+-
+-    jmp _audio_loop
+\ No newline at end of file
++    rts
