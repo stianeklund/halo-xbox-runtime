@@ -33,7 +33,10 @@ void *__cdecl compat_memcpy(void *dst, const void *src,
                             size_t size) __asm__("_memcpy");
 void XVideoWaitForVBlank(void);
 int XVideoSetMode(int width, int height, int bpp, int refresh);
+unsigned char *XVideoGetFB(void);
 void XVideoSetFB(unsigned char *fb);
+void XVideoFlushFB(void);
+void XVideoSetVideoEnable(int enable);
 int pb_init(void);
 void halo_standalone_missing(const char *name);
 unsigned long pb_wait_for_vbl(void);
@@ -238,6 +241,7 @@ static unsigned long d3d_completed_time;
 static float d3d_transforms[D3DTS_COUNT][16];
 static unsigned long *d3d_render_target;
 static unsigned long *d3d_depth_stencil;
+static unsigned char *d3d_idle_framebuffer;
 static void *d3d_visibility_report_pages[16];
 static int d3d_pbkit_ready;
 static int d3d_targets_dirty;
@@ -911,8 +915,11 @@ int __stdcall Direct3D_CreateDevice(uint32_t adapter, uint32_t device_type,
       *out_device = 0;
       return E_OUTOFMEMORY;
     }
+    /* The startup probe presents before Halo renders or clears a frame. */
+    compat_memset(tmp.allocation, 0, container_bytes(tmp.format, tmp.size));
     compat_memcpy((unsigned char *)surfaces + i * 0x18, &tmp, 0x18);
   }
+  XVideoFlushFB();
   if (pp->enable_auto_depth_stencil) {
     depth = resource_new(D3DCOMMON_TYPE_SURFACE);
     if (!depth || !init_buffer_surface(depth, width, height,
@@ -933,8 +940,14 @@ int __stdcall Direct3D_CreateDevice(uint32_t adapter, uint32_t device_type,
   d3d_depth_stencil =
     (unsigned long *)*device_field(DEVICE_DEPTH_STENCIL_SURFACE);
   d3d_targets_dirty = 1;
-  XVideoSetMode((int)width, (int)height, VIDEO_BITS_PER_PIXEL,
-                VIDEO_REFRESH_DEFAULT);
+  d3d_idle_framebuffer = 0;
+  if (XVideoSetMode((int)width, (int)height, VIDEO_BITS_PER_PIXEL,
+                    VIDEO_REFRESH_DEFAULT)) {
+    /* nxdk owns this cleared buffer until the next mode change. Keep its
+     * physical address before scanout switches to the device's surfaces. */
+    d3d_idle_framebuffer =
+      (unsigned char *)MmGetPhysicalAddress(XVideoGetFB());
+  }
   if (!d3d_pbkit_ready) {
     /* Halo asks the XDK for a 768KB push buffer (D3D_SetPushBufferSize);
      * pbkit does not wrap, so it gets a larger one (d3d8_draw.c). */
@@ -949,13 +962,24 @@ int __stdcall Direct3D_CreateDevice(uint32_t adapter, uint32_t device_type,
       compat_d3d_push_rewind();
     }
   }
-  XVideoSetFB((unsigned char *)buffer_surface(DEVICE_FRONT_BUFFER_SLOT)[1]);
   D3D_g_pDevice = (uint8_t *)d3d_device;
   *device_field(DEVICE_RENDER_TARGET_SURFACE) =
     (unsigned long)d3d_render_target;
   compat_d3d_state_initialize();
   compat_d3d_set_depth_scale(d3d_depth_stencil);
   compat_d3d_draw_initialize();
+  if (d3d_pbkit_ready) {
+    /* Establish both color surfaces on the GPU before scanout. A CPU clear
+     * alone leaves xemu on its VGA fallback until the first rendered frame. */
+    for (i = DEVICE_FRONT_BUFFER_SLOT; i >= DEVICE_BACK_BUFFER_SLOT; i--) {
+      d3d_render_target = buffer_surface(i);
+      gpu_bind_targets();
+      gpu_clear(0, D3DCLEAR_TARGET_R | D3DCLEAR_TARGET_G |
+                     D3DCLEAR_TARGET_B | D3DCLEAR_TARGET_A, 0, 0);
+    }
+    pb_wait_until_gr_not_busy();
+  }
+  XVideoSetFB((unsigned char *)buffer_surface(DEVICE_FRONT_BUFFER_SLOT)[1]);
   if (!d3d_vblank_thread) {
     d3d_vblank_thread =
       compat_CreateThread(NULL, 0, vblank_thread, NULL, 0, NULL);
@@ -1243,10 +1267,11 @@ void __stdcall D3D_DestroyResource(void *resource)
  * clears it and D3D_g_pDevice. rasterizer_preinitialize creates a probe
  * device and releases it before rasterizer_initialize creates the real one,
  * so the probe's buffers must go back to contiguous memory here. The
- * display keeps scanning the freed front buffer until the next
- * Direct3D_CreateDevice points it at a new one. */
+ * display must switch to nxdk's cleared buffer before those pages can be
+ * reused by physical_memory_allocate or other startup allocations. */
 void D3DDevice_Release(void)
 {
+  unsigned long idle_surface[6];
   unsigned long *surface;
   unsigned long count;
   int i;
@@ -1256,6 +1281,28 @@ void D3DDevice_Release(void)
     *device_field(DEVICE_REFERENCE_COUNT) = count - 1;
     return;
   }
+  if (d3d_pbkit_ready) {
+    if (d3d_idle_framebuffer) {
+      /* The idle buffer must also have a GPU color surface while the probe's
+       * surfaces are freed and Halo performs the rest of its startup. */
+      compat_memcpy(idle_surface, buffer_surface(DEVICE_FRONT_BUFFER_SLOT),
+                     sizeof(idle_surface));
+      idle_surface[1] = (unsigned long)d3d_idle_framebuffer;
+      d3d_render_target = idle_surface;
+      d3d_depth_stencil = 0;
+      gpu_bind_targets();
+      gpu_clear(0, D3DCLEAR_TARGET_R | D3DCLEAR_TARGET_G |
+                     D3DCLEAR_TARGET_B | D3DCLEAR_TARGET_A, 0, 0);
+    }
+    pb_wait_until_gr_not_busy();
+  }
+  if (d3d_idle_framebuffer) {
+    XVideoSetFB(d3d_idle_framebuffer);
+  } else {
+    XVideoSetVideoEnable(0);
+  }
+  /* Let scanout finish the old frame before freeing its memory. */
+  wait_for_vblank();
   for (i = 0; i < DEVICE_BUFFER_SURFACE_COUNT; i++) {
     /* Buffer slots are bare 0x18-byte headers (Direct3D_CreateDevice), not
      * compat_resources; the bits are video_alloc memory at Data. */
