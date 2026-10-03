@@ -287,6 +287,20 @@ static int __cdecl xapi_init_process(void)
     FUN_001d819f(title_id(), (short *)(*(unsigned char **)XBE_CERTIFICATE_ADDRESS +
                                        XBE_CERTIFICATE_TITLE_NAME));
   }
+  /* The original opens \Device\Harddisk0\partition1\UDATA\NICKNAME.XBN by
+   * device path; nxdk's CreateFileA needs a drive letter, and only D: is
+   * mounted for it. Link E: to that partition so compat/xapi/nickname.c can
+   * reach it. A collision means E: already exists, which is fine. */
+  {
+    static char e_link_name[] = "\\??\\E:";
+    static char e_volume[] = "\\Device\\Harddisk0\\Partition1";
+    ANSI_STRING e_link;
+    ANSI_STRING e_target;
+
+    init_ansi(&e_link, e_link_name);
+    init_ansi(&e_target, e_volume);
+    IoCreateSymbolicLink(&e_link, &e_target);
+  }
   /* The original start-up boots to the dashboard on failure. Keep running
    * instead so the failure surfaces in the game's own asserts. */
   if ((init_flags & XINIT_MOUNT_UTILITYDRIVE) &&

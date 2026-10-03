@@ -438,7 +438,9 @@ def main():
         if nxt - e['addr'] < 5:
             skipped_short += 1
             continue
-        raw = defined_raw.get(e['name'])
+        # A lift that was never renamed from its auto name still defines
+        # FUN_<addr> while the catalog names the function, so fall back to it.
+        raw = defined_raw.get(e['name']) or defined_raw.get('FUN_%08x' % e['addr'])
         if raw and not REG_ANNOT_RE.search(e['decl']) and raw.startswith(('_', '@')):
             tramps.append((e['addr'], raw))
             tramp_kind['implemented'] += 1
