@@ -7,3 +7,5 @@ tmp*/
 .serena/
 .idea/
 .codegraph
+xbdm/
+hs_err_pid*.log
