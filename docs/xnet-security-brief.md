@@ -41,6 +41,42 @@ packets, without including XBE code. Tests compare exact reference bytes,
 including the handshake; they also cover tampering, malformed lengths/padding,
 replay rejection, UDP/TCP segments, retries, timeout, teardown and reconnect.
 
+The reference fixture covers only the initiator's request. The responder's
+reply was first seen in a live capture of this stack joining a stock cachebeta
+host (xemu, bridged): the wire always carries the initiator's SPI at +4 and the
+responder's at +8, then the initiator's nonce at +12 and the responder's at
++20, whichever side sends. The first implementation sent the sender's own SPI
+first, so the host accepted our requests and we rejected every reply.
+`capture_fixture` in `tools/test_xnet_security.c` replays the captured request
+and reply for both roles. The capture's LAN/kernel keys are unknown, so it
+re-signs the captured bytes and pins layout, not the MAC. The initiator's final
+ack and the session after it are not yet seen on the wire against a stock host.
+
+Halo gives a TCP connect to a secure address one 1 s select, and its SYN waits
+in the peer queue during the key exchange, so the timing follows the original.
+A request goes out with the first queued segment, timed from a fresh clock
+reading. It is retried every 2 s, four times, and 2 s after the last retry the
+peer goes back to idle (`0x227ac0` -> `0x2268c8`). We used to retry after
+0.5 s or less. A stock responder re-keys on every request with a newer serial
+(`0x227d26`), so such a retry got a second reply with a new nonce while we kept
+the first keys. A reply with our nonce, a valid MAC and a newer serial is
+therefore accepted after the exchange too: a new responder nonce or SPI
+re-derives and adopts the keys. Exact duplicates fail the serial check, and
+wrong nonces or MACs are rejected. The stock initiator does not re-derive here.
+It avoids the race with its 2 s retry. As at the `0x227d26` tail, the reply
+flushes queued segments instead of the ack; the ack goes out only when the
+queue is empty. Before, the ack and the SYN were sent back to back. If the send
+callback refuses a frame (a full NIC or XBDM ring), the flush stops. That frame
+and the frames after it stay queued in order, and later segments wait behind
+them. Each 100 ms tick tries again. The serial starts at `KeQuerySystemTime`
+(`0x22724d`; the captured host reply carries one). It was random, so after a
+restart a host that still held our old serial dropped about half of our
+requests. It now never falls below the previous value within a boot. The ack's
+MAC uses the initiator's directional key from derivation indices 1-2 (peer
+`+0x58` at `0x2278f6`). The responder checks it against its matching receive
+key (`+0x48` at `0x227d26`). This is read from the code, not yet seen on the
+wire.
+
 The integration sends outer IPv4/UDP 3074 packets directly to peer Ethernet
 addresses, routes virtual secure addresses through a separate lwIP interface,
 and recomputes decrypted inner checksums for lwIP. Discovery routing works

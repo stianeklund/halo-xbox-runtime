@@ -145,8 +145,23 @@ static void deliver(void *user, uint32_t source, uint8_t protocol,
   put16(ip + 10, sum(ip, 20, 0));
   ip4_input(p, &secure_interface);
 }
-static const struct xsec_ops ops = {random_bytes, hmac_sha1, cbc,
-                                    modexp,       wire_send, deliver};
+static uint32_t milliseconds(void *user) {
+  (void)user;
+  return sys_now();
+}
+static uint64_t system_time(void *user) {
+  (void)user;
+#ifdef HALO_NETWORK_HOST_TEST
+  return sys_now(); /* the host kernel shim has no system clock */
+#else
+  LARGE_INTEGER now;
+  KeQuerySystemTime(&now);
+  return (uint64_t)now.QuadPart;
+#endif
+}
+static const struct xsec_ops ops = {random_bytes, hmac_sha1,    cbc,
+                                    modexp,       wire_send,    deliver,
+                                    milliseconds, system_time};
 static void timer(void *unused) {
   (void)unused;
   if (security_refs)
@@ -281,6 +296,8 @@ int halo_net_security_start(unsigned flags) {
   if (security_refs && flags != startup_flags)
     r = 10022;
   else if (!security_refs) {
+    /* security is static and xsec_clear keeps its serial, so a restart in
+     * this boot continues above the last handshake serial we sent. */
     r = xsec_init(&security, &ops, NULL, interface->hwaddr, XboxLANKey,
                   halo_title_lan_key);
     startup_flags = flags;

@@ -4,6 +4,10 @@
 #include "security.h"
 #include <limits.h>
 #include <string.h>
+/* Key exchange timer (0x227ac0): a message, then one retry every 2 s, four
+ * times; 2 s after the last retry the peer goes back to idle. */
+#define XSEC_RETRY_MS 2000
+#define XSEC_RETRIES 4
 const uint8_t xsec_modulus[96] = {
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc9, 0x0f, 0xda, 0xa2,
     0x21, 0x68, 0xc2, 0x34, 0xc4, 0xc6, 0x62, 0x8b, 0x80, 0xdc, 0x1c, 0xd1,
@@ -74,15 +78,21 @@ static int segment_valid(uint8_t protocol, const uint8_t *p, unsigned n) {
 }
 int xsec_init(struct xsec *s, const struct xsec_ops *ops, void *user,
               const uint8_t *mac, const uint8_t *lan, const uint8_t *title) {
-  uint8_t input[17], digest[20], seed[10];
+  uint8_t input[17], digest[20], seed[2];
+  uint64_t previous = s->serial;
   memset(s, 0, sizeof(*s));
   s->ops = *ops;
   s->user = user;
   memcpy(s->mac, mac, 6);
+  /* The serial starts at the system time (0x22724d) and only ever increases: a
+   * stock peer drops a handshake whose serial is not above the last one it
+   * kept for us (signed compare at 0x227d26), across our restarts too. */
+  s->serial = ops->system_time(user);
+  if (s->serial < previous)
+    s->serial = previous;
   if (ops->random(user, seed, sizeof(seed)))
     return 10091;
   s->generation = (uint16_t)(seed[0] | seed[1] << 8);
-  s->serial = le64(seed + 2);
   memcpy(input + 1, title, 16);
   input[0] = 0;
   ops->hmac(user, lan, input, 17, NULL, 0, digest);
@@ -162,8 +172,6 @@ int xsec_map(struct xsec *s, const struct halo_xnaddr *addr, const uint8_t *id,
     if (s->peers[i].used && s->peers[i].key == k &&
         equal(s->peers[i].addr.ethernet, addr->ethernet, 6)) {
       *ip = s->peers[i].local_spi;
-      if (s->peers[i].state == 4)
-        s->peers[i].state = 0;
       return 0;
     }
   for (i = 0; i < XSEC_PEERS; i++)
@@ -257,8 +265,11 @@ static int handshake_send(struct xsec *s, struct xsec_peer *p, int ack) {
   uint8_t out[164] = {0}, digest[20];
   struct xsec_key *k = &s->keys[p->key];
   if (!ack) {
-    memcpy(out + 4, &p->local_spi, 4);
-    memcpy(out + 8, &p->remote_spi, 4);
+    /* Fixed roles on the wire, whoever sends: initiator SPI, then responder SPI
+     * (zero in the first message), then the nonces in the same order. Verified
+     * against a cachebeta host's reply in a live capture. */
+    memcpy(out + 4, p->initiator ? &p->local_spi : &p->remote_spi, 4);
+    memcpy(out + 8, p->initiator ? &p->remote_spi : &p->local_spi, 4);
     if (p->initiator) {
       memcpy(out + 12, p->nonce_local, 8);
       memcpy(out + 20, p->nonce_remote, 8);
@@ -341,10 +352,29 @@ static int send_ready(struct xsec *s, struct xsec_peer *p, uint8_t protocol,
   memcpy(p->iv, out + size - 20, 8);
   return s->ops.send(s->user, p->addr.ethernet, out, size, 0);
 }
-static void flush(struct xsec *s, struct xsec_peer *p) {
-  unsigned i;
-  for (i = 0; i < p->queued; i++)
-    send_ready(s, p, p->queue[i].protocol, p->queue[i].data, p->queue[i].len);
+/* Sends the queue in order. The first failure (send_ready's non-zero return:
+ * ops.send refusing the frame, e.g. 10055 from a full NIC ring, or an encoding
+ * error) stops it; that segment and the rest stay queued, in order, for the
+ * next xsec_tick. Returns that failure, or zero once the queue is empty. */
+static int flush(struct xsec *s, struct xsec_peer *p) {
+  unsigned sent;
+  int r = 0;
+  for (sent = 0; sent < p->queued; sent++) {
+    r = send_ready(s, p, p->queue[sent].protocol, p->queue[sent].data,
+                   p->queue[sent].len);
+    if (r)
+      break;
+  }
+  p->queued -= sent;
+  memmove(p->queue, p->queue + sent, p->queued * sizeof(p->queue[0]));
+  wipe(p->queue + p->queued, (XSEC_QUEUE - p->queued) * sizeof(p->queue[0]));
+  return r;
+}
+/* Retries ran out (0x227ac0 -> 0x2268c8): back to idle, not a failed state; the
+ * next segment for this peer starts a new exchange. The serial is kept. */
+static void reset(struct xsec_peer *p) {
+  p->state = 0;
+  p->retries = 0;
   wipe(p->queue, sizeof(p->queue));
   p->queued = 0;
 }
@@ -371,10 +401,9 @@ int xsec_send_segment(struct xsec *s, uint32_t ip, uint8_t protocol,
   p = peer_spi(s, ip);
   if (!p)
     return 10049;
-  if (p->state == 3)
+  /* Behind queued segments a new one waits its turn, to keep the order. */
+  if (p->state == 3 && (!p->queued || !flush(s, p)))
     return send_ready(s, p, protocol, data, n);
-  if (p->state == 4)
-    return 10060;
   if (p->queued == XSEC_QUEUE)
     return 10055;
   if (!p->state) {
@@ -382,8 +411,8 @@ int xsec_send_segment(struct xsec *s, uint32_t ip, uint8_t protocol,
       return 10091;
     p->initiator = 1;
     p->state = 1;
-    p->retry_at = s->now + 500;
-    p->deadline = s->now + 10000;
+    /* A fresh reading: the tick's clock can be up to a tick old. */
+    p->retry_at = s->ops.milliseconds(s->user) + XSEC_RETRY_MS;
     p->retries = 0;
     r = handshake_send(s, p, 0);
     if (r) {
@@ -398,7 +427,7 @@ int xsec_send_segment(struct xsec *s, uint32_t ip, uint8_t protocol,
 }
 static int receive_handshake(struct xsec *s, const uint8_t *mac,
                              const uint8_t *in, unsigned n) {
-  uint32_t src, dst, ip;
+  uint32_t initiator, responder, src, dst, ip;
   uint64_t serial;
   struct xsec_peer *p;
   struct halo_xnaddr addr = {0};
@@ -407,8 +436,14 @@ static int receive_handshake(struct xsec *s, const uint8_t *mac,
   if (n != 164 || !equal(in, (const uint8_t[4]){0}, 4) || in[132] != 12 ||
       in[133] || !equal(in + 134, mac, 6))
     return 10022;
-  memcpy(&src, in + 4, 4);
-  memcpy(&dst, in + 8, 4);
+  /* The wire carries the initiator's SPI at +4 and the responder's at +8. From
+   * our side: a request has no responder yet, a reply carries both, and the
+   * initiator's final ack has no initiator SPI. src is the peer's SPI and dst
+   * is ours (zero for a request, which names no session of ours yet). */
+  memcpy(&initiator, in + 4, 4);
+  memcpy(&responder, in + 8, 4);
+  src = !initiator ? 0 : responder ? responder : initiator;
+  dst = !initiator ? responder : responder ? initiator : 0;
   serial = le64(in + 144);
   k = key_index(s, in + 124);
   if (k < 0)
@@ -462,30 +497,40 @@ static int receive_handshake(struct xsec *s, const uint8_t *mac,
     }
     p->remote_serial = serial;
     p->state = 2;
-    p->retry_at = s->now + 500;
-    p->deadline = s->now + 10000;
+    p->retry_at = s->ops.milliseconds(s->user) + XSEC_RETRY_MS;
+    p->retries = 0;
     return handshake_send(s, p, 0);
   }
-  if (p->state == 3 && p->initiator && src == p->remote_spi &&
-      equal(p->nonce_local, in + 12, 8) && equal(p->nonce_remote, in + 20, 8)) {
-    if (serial <= p->remote_serial)
-      return 10013;
-    p->remote_serial = serial;
-    return handshake_send(s, p, 1);
-  }
-  if (p->state != 1 || !equal(p->nonce_local, in + 12, 8) ||
-      serial <= p->remote_serial)
+  /* A reply to us: it carries our nonce and, like every handshake, a newer
+   * serial, so an exact duplicate is dropped here. A stock responder re-keys on
+   * every newer request (0x227d26), so one of our retries can draw a second
+   * reply with a new responder nonce (and SPI) after the first completed the
+   * exchange. The host now holds those keys: adopt them, as for a first reply.
+   * The stock initiator (also 0x227d26) would keep its first keys; it retries
+   * only every 2 s, which makes the race rare there. */
+  if ((p->state != 1 && (p->state != 3 || !p->initiator)) ||
+      !equal(p->nonce_local, in + 12, 8) || serial <= p->remote_serial)
     return 10013;
-  p->remote_spi = src;
-  memcpy(p->nonce_remote, in + 20, 8);
-  r = derive(s, p, in + 28);
-  if (r)
-    return r;
+  if (p->state == 1 || src != p->remote_spi ||
+      !equal(p->nonce_remote, in + 20, 8)) {
+    p->remote_spi = src;
+    memcpy(p->nonce_remote, in + 20, 8);
+    r = derive(s, p, in + 28);
+    if (r) {
+      if (p->state == 3)
+        reset(p); /* keys half replaced: start over on the next segment */
+      return r;
+    }
+  }
   p->remote_serial = serial;
   p->state = 3;
-  handshake_send(s, p, 1);
-  flush(s, p);
-  return 0;
+  /* 0x227d26 tail: queued segments go out instead of the ack, which is sent
+   * only when nothing was waiting. Either one completes the responder. */
+  if (p->queued) {
+    flush(s, p);
+    return 0;
+  }
+  return handshake_send(s, p, 1);
 }
 int xsec_receive(struct xsec *s, const uint8_t *mac, const uint8_t *in,
                  unsigned n, int broadcast) {
@@ -544,21 +589,21 @@ int xsec_receive(struct xsec *s, const uint8_t *mac, const uint8_t *in,
 }
 void xsec_tick(struct xsec *s, uint32_t now) {
   unsigned i;
-  s->now = now;
   for (i = 0; i < XSEC_PEERS; i++) {
     struct xsec_peer *p = &s->peers[i];
-    if (!p->used || (p->state != 1 && p->state != 2))
+    if (!p->used)
       continue;
-    if ((int32_t)(now - p->deadline) >= 0) {
-      p->state = 4;
-      wipe(p->queue, sizeof(p->queue));
-      p->queued = 0;
+    if (p->state == 3 && p->queued)
+      flush(s, p); /* what a busy NIC refused earlier */
+    if ((p->state != 1 && p->state != 2) ||
+        (int32_t)(now - p->retry_at) < 0)
+      continue;
+    if (p->retries == XSEC_RETRIES) {
+      reset(p);
       continue;
     }
-    if ((int32_t)(now - p->retry_at) >= 0) {
-      handshake_send(s, p, 0);
-      p->retry_at = now + 500;
-      ++p->retries;
-    }
+    ++p->retries;
+    p->retry_at = now + XSEC_RETRY_MS;
+    handshake_send(s, p, 0);
   }
 }
