@@ -48,7 +48,7 @@ the repo. Copy them from the title's `media` directory. The whole of
 keeps that notice. The full license is in
 [`LICENSES/LGPL-2.1-or-later.txt`](../LICENSES/LGPL-2.1-or-later.txt).
 The original contributions in the other compatibility files use the project's
-GPL-3.0-only license; see [`LICENSE`](../LICENSE).
+AGPL-3.0-only license; see [`LICENSE`](../LICENSE).
 
 The project license does not replace the decoder's LGPL license or upstream
 copyright notices. When distributing a linked executable, include the applicable

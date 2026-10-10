@@ -40,8 +40,8 @@ seeded bring-up variant, the boot-test loop and the status.
 ## License
 
 Unless a file states otherwise, original contributions to halo-xbox-runtime are
-licensed under the **GNU General Public License, version 3 only**
-(`GPL-3.0-only`). See [LICENSE](LICENSE) for the full terms.
+licensed under the **GNU Affero General Public License, version 3 only**
+(`AGPL-3.0-only`). See [LICENSE](LICENSE) for the full terms.
 
 The FFmpeg-derived Bink decoder files retain their **LGPL-2.1-or-later**
 license and copyright notices; see [docs/bink.md](docs/bink.md#license) and
